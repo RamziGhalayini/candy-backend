@@ -1,6 +1,15 @@
+databases:
+  - name: candy-backend-db
+    plan: free
+
 services:
   - type: web
     name: candy-backend
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: candy-backend-db
+          property: connectionString
