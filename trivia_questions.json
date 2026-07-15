@@ -1,0 +1,44 @@
+[
+  {
+    "id": "trivia-001",
+    "question": "What was the original purpose of carving faces into turnips and potatoes, the ancestor of the jack-o'-lantern?",
+    "choices": ["To scare away wandering spirits", "To mark a house with candy", "To celebrate the harvest moon", "To signal trick-or-treaters"],
+    "correct_index": 0
+  },
+  {
+    "id": "trivia-002",
+    "question": "Which candy is most often cited as the top-selling Halloween treat in the US?",
+    "choices": ["Candy corn", "Reese's Peanut Butter Cups", "Gummy worms", "Licorice"],
+    "correct_index": 1
+  },
+  {
+    "id": "trivia-003",
+    "question": "What color combination is traditionally associated with Halloween?",
+    "choices": ["Red and green", "Orange and black", "Purple and gold", "Blue and silver"],
+    "correct_index": 1
+  },
+  {
+    "id": "trivia-004",
+    "question": "The word 'Halloween' is a shortened form of what older phrase?",
+    "choices": ["All Hallows' Eve", "Harvest Evening", "Hollow Evening", "All Souls' Night"],
+    "correct_index": 0
+  },
+  {
+    "id": "trivia-005",
+    "question": "Which of these is a classic Halloween activity besides trick-or-treating?",
+    "choices": ["Apple bobbing", "Egg hunting", "Snow sculpting", "Kite flying"],
+    "correct_index": 0
+  },
+  {
+    "id": "trivia-006",
+    "question": "What is the name for a lit, carved pumpkin traditionally placed on porches in October?",
+    "choices": ["Jack-o'-lantern", "Sun catcher", "Harvest lamp", "Ghost light"],
+    "correct_index": 0
+  },
+  {
+    "id": "trivia-007",
+    "question": "Which of these animals is most commonly associated with Halloween imagery?",
+    "choices": ["Black cat", "Golden retriever", "Peacock", "Dolphin"],
+    "correct_index": 0
+  }
+]

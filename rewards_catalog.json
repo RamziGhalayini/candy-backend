@@ -1,0 +1,34 @@
+[
+  {
+    "id": "founder-sugarplum-bars",
+    "name": "Free full-size candy bar coupon",
+    "points_cost": 50,
+    "sponsor_name": "Sugarplum Confections",
+    "sponsor_type": "founder_brand",
+    "image_url": ""
+  },
+  {
+    "id": "founder-lantern-cocoa",
+    "name": "$3 off hot cocoa mix",
+    "points_cost": 40,
+    "sponsor_name": "Lantern & Co.",
+    "sponsor_type": "founder_brand",
+    "image_url": ""
+  },
+  {
+    "id": "local-village-bakery",
+    "name": "Free mini pumpkin muffin",
+    "points_cost": 30,
+    "sponsor_name": "Village Corner Bakery",
+    "sponsor_type": "local_business",
+    "image_url": ""
+  },
+  {
+    "id": "app-sticker-pack",
+    "name": "TreatMap digital sticker pack",
+    "points_cost": 20,
+    "sponsor_name": "TreatMap",
+    "sponsor_type": "app_official",
+    "image_url": ""
+  }
+]
