@@ -256,7 +256,11 @@ def test_points_lookup_defaults_to_zero_without_creating_household(client):
     response = client.get("/points/never-seen-device")
 
     assert response.status_code == 200
-    assert response.get_json() == {"device_id": "never-seen-device", "points": 0}
+    assert response.get_json() == {
+        "device_id": "never-seen-device",
+        "points": 0,
+        "greetings_unlocked": False,
+    }
     assert Household.query.filter_by(device_id="never-seen-device").first() is None
 
 

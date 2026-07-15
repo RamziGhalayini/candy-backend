@@ -67,6 +67,7 @@ class Stop(db.Model):
     registrant_device_id = db.Column(db.String, nullable=True)
     verification_bonus_awarded = db.Column(db.Boolean, nullable=False, default=False)
     candy_count = db.Column(db.Integer, nullable=True)
+    greeting_audio_url = db.Column(db.String, nullable=True)
 
     def is_verified(self):
         """True once at least 2 registrations share (roughly) this address."""
@@ -94,6 +95,7 @@ class Stop(db.Model):
             "is_hidden": self.is_hidden,
             "verified": self.is_verified(),
             "candy_count": self.candy_count,
+            "greeting_audio_url": self.greeting_audio_url,
         }
 
 
@@ -104,6 +106,7 @@ class Household(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     device_id = db.Column(db.String, unique=True, nullable=False, index=True)
     points = db.Column(db.Integer, nullable=False, default=0)
+    greetings_unlocked = db.Column(db.Boolean, nullable=False, default=False)
 
 
 class CheckIn(db.Model):
@@ -146,36 +149,51 @@ class Redemption(db.Model):
 
 
 def _run_lightweight_migrations():
-    """ALTER TABLE in any additive columns missing from a pre-existing stop table."""
+    """ALTER TABLE in any additive columns missing from pre-existing tables."""
     inspector = inspect(db.engine)
-    if "stop" not in inspector.get_table_names():
-        return
+    table_names = inspector.get_table_names()
 
-    existing_columns = {col["name"] for col in inspector.get_columns("stop")}
-    with db.engine.begin() as connection:
-        if "report_count" not in existing_columns:
-            connection.execute(
-                text("ALTER TABLE stop ADD COLUMN report_count INTEGER NOT NULL DEFAULT 0")
-            )
-        if "is_hidden" not in existing_columns:
-            connection.execute(
-                text("ALTER TABLE stop ADD COLUMN is_hidden BOOLEAN NOT NULL DEFAULT FALSE")
-            )
-        if "registrant_device_id" not in existing_columns:
-            connection.execute(
-                text("ALTER TABLE stop ADD COLUMN registrant_device_id VARCHAR")
-            )
-        if "verification_bonus_awarded" not in existing_columns:
-            connection.execute(
-                text(
-                    "ALTER TABLE stop ADD COLUMN verification_bonus_awarded "
-                    "BOOLEAN NOT NULL DEFAULT FALSE"
+    if "stop" in table_names:
+        existing_columns = {col["name"] for col in inspector.get_columns("stop")}
+        with db.engine.begin() as connection:
+            if "report_count" not in existing_columns:
+                connection.execute(
+                    text("ALTER TABLE stop ADD COLUMN report_count INTEGER NOT NULL DEFAULT 0")
                 )
-            )
-        if "candy_count" not in existing_columns:
-            connection.execute(
-                text("ALTER TABLE stop ADD COLUMN candy_count INTEGER")
-            )
+            if "is_hidden" not in existing_columns:
+                connection.execute(
+                    text("ALTER TABLE stop ADD COLUMN is_hidden BOOLEAN NOT NULL DEFAULT FALSE")
+                )
+            if "registrant_device_id" not in existing_columns:
+                connection.execute(
+                    text("ALTER TABLE stop ADD COLUMN registrant_device_id VARCHAR")
+                )
+            if "verification_bonus_awarded" not in existing_columns:
+                connection.execute(
+                    text(
+                        "ALTER TABLE stop ADD COLUMN verification_bonus_awarded "
+                        "BOOLEAN NOT NULL DEFAULT FALSE"
+                    )
+                )
+            if "candy_count" not in existing_columns:
+                connection.execute(
+                    text("ALTER TABLE stop ADD COLUMN candy_count INTEGER")
+                )
+            if "greeting_audio_url" not in existing_columns:
+                connection.execute(
+                    text("ALTER TABLE stop ADD COLUMN greeting_audio_url VARCHAR")
+                )
+
+    if "household" in table_names:
+        existing_columns = {col["name"] for col in inspector.get_columns("household")}
+        with db.engine.begin() as connection:
+            if "greetings_unlocked" not in existing_columns:
+                connection.execute(
+                    text(
+                        "ALTER TABLE household ADD COLUMN greetings_unlocked "
+                        "BOOLEAN NOT NULL DEFAULT FALSE"
+                    )
+                )
 
 
 with app.app_context():
@@ -509,7 +527,8 @@ def redeem_reward(reward_id):
 def get_points(device_id):
     household = Household.query.filter_by(device_id=device_id).first()
     points = household.points if household is not None else 0
-    return jsonify({"device_id": device_id, "points": points})
+    greetings_unlocked = household.greetings_unlocked if household is not None else False
+    return jsonify({"device_id": device_id, "points": points, "greetings_unlocked": greetings_unlocked})
 
 
 if __name__ == "__main__":
