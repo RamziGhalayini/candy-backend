@@ -46,6 +46,7 @@ CHECKIN_POINTS = 5
 VERIFICATION_BONUS_POINTS = 10
 TRIVIA_POINTS = 10
 CHECKIN_RADIUS_METERS = 75
+CHECKIN_MILESTONE_INTERVAL = 20
 
 basedir = os.path.abspath(os.path.dirname(__file__))
 with open(os.path.join(basedir, "trivia_questions.json")) as f:
@@ -65,6 +66,7 @@ class Stop(db.Model):
     is_hidden = db.Column(db.Boolean, nullable=False, default=False)
     registrant_device_id = db.Column(db.String, nullable=True)
     verification_bonus_awarded = db.Column(db.Boolean, nullable=False, default=False)
+    candy_count = db.Column(db.Integer, nullable=True)
 
     def is_verified(self):
         """True once at least 2 registrations share (roughly) this address."""
@@ -91,6 +93,7 @@ class Stop(db.Model):
             "report_count": self.report_count,
             "is_hidden": self.is_hidden,
             "verified": self.is_verified(),
+            "candy_count": self.candy_count,
         }
 
 
@@ -168,6 +171,10 @@ def _run_lightweight_migrations():
                     "ALTER TABLE stop ADD COLUMN verification_bonus_awarded "
                     "BOOLEAN NOT NULL DEFAULT FALSE"
                 )
+            )
+        if "candy_count" not in existing_columns:
+            connection.execute(
+                text("ALTER TABLE stop ADD COLUMN candy_count INTEGER")
             )
 
 
@@ -248,6 +255,7 @@ def register_stop():
     latitude = data.get("latitude")
     longitude = data.get("longitude")
     device_id = data.get("device_id")
+    candy_count = data.get("candy_count")
 
     if name is None or stop_type is None or latitude is None or longitude is None:
         return jsonify({"error": "name, type, latitude, and longitude are required"}), 400
@@ -258,6 +266,10 @@ def register_stop():
     except (TypeError, ValueError):
         return jsonify({"error": "latitude and longitude must be numbers"}), 400
 
+    if candy_count is not None:
+        if isinstance(candy_count, bool) or not isinstance(candy_count, int) or candy_count < 0:
+            return jsonify({"error": "candy_count must be a non-negative integer"}), 400
+
     stop = Stop(
         name=name,
         type=stop_type,
@@ -265,6 +277,7 @@ def register_stop():
         longitude=longitude,
         candy_available=True,
         registrant_device_id=device_id,
+        candy_count=candy_count,
     )
     db.session.add(stop)
     db.session.commit()
@@ -376,9 +389,25 @@ def check_in():
 
     db.session.add(CheckIn(device_id=device_id, stop_id=stop_id, check_in_date=today))
     household = _award_points(device_id, CHECKIN_POINTS)
+
+    if stop.candy_count is not None:
+        stop.candy_count = max(stop.candy_count - 1, 0)
+        if stop.candy_count == 0:
+            stop.is_hidden = True
+
     db.session.commit()
 
-    return jsonify({"points_awarded": CHECKIN_POINTS, "points_total": household.points})
+    total_checkins = CheckIn.query.filter_by(device_id=device_id).count()
+
+    result = {"points_awarded": CHECKIN_POINTS, "points_total": household.points}
+    if total_checkins % CHECKIN_MILESTONE_INTERVAL == 0:
+        result["milestone"] = True
+        result["message"] = (
+            f"🎉 Milestone! You've checked in at {total_checkins} stops — "
+            "ask for an extra piece, you've earned it!"
+        )
+
+    return jsonify(result)
 
 
 @app.route("/trivia/today", methods=["GET"])

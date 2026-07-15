@@ -258,3 +258,143 @@ def test_points_lookup_defaults_to_zero_without_creating_household(client):
     assert response.status_code == 200
     assert response.get_json() == {"device_id": "never-seen-device", "points": 0}
     assert Household.query.filter_by(device_id="never-seen-device").first() is None
+
+
+# ── Candy count ───────────────────────────────────────────────────────────
+
+
+def test_register_stop_accepts_optional_candy_count(client):
+    response = client.post(
+        "/register-stop",
+        json={
+            "name": "Stocked House",
+            "type": "house",
+            "latitude": 42.0,
+            "longitude": -71.0,
+            "device_id": "registrant-1",
+            "candy_count": 3,
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.get_json()["candy_count"] == 3
+
+
+def test_register_stop_without_candy_count_defaults_to_null(client):
+    response = client.post(
+        "/register-stop",
+        json={
+            "name": "Unstocked House",
+            "type": "house",
+            "latitude": 42.0,
+            "longitude": -71.0,
+            "device_id": "registrant-1",
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.get_json()["candy_count"] is None
+
+
+def test_register_stop_rejects_negative_candy_count(client):
+    response = client.post(
+        "/register-stop",
+        json={
+            "name": "Bad House",
+            "type": "house",
+            "latitude": 42.0,
+            "longitude": -71.0,
+            "candy_count": -1,
+        },
+    )
+
+    assert response.status_code == 400
+    assert "candy_count" in response.get_json()["error"]
+
+
+def test_check_in_decrements_candy_count(client):
+    stop = _make_verified_stop(client)
+    stop.candy_count = 2
+    db.session.commit()
+
+    response = client.post(
+        "/check-in",
+        json={
+            "device_id": "checker-1",
+            "stop_id": stop.id,
+            "latitude": stop.latitude,
+            "longitude": stop.longitude,
+        },
+    )
+
+    assert response.status_code == 200
+    refreshed = db.session.get(Stop, stop.id)
+    assert refreshed.candy_count == 1
+    assert refreshed.is_hidden is False
+
+
+def test_check_in_hides_stop_when_candy_count_reaches_zero(client):
+    stop = _make_verified_stop(client)
+    stop.candy_count = 1
+    db.session.commit()
+
+    response = client.post(
+        "/check-in",
+        json={
+            "device_id": "checker-1",
+            "stop_id": stop.id,
+            "latitude": stop.latitude,
+            "longitude": stop.longitude,
+        },
+    )
+
+    assert response.status_code == 200
+    refreshed = db.session.get(Stop, stop.id)
+    assert refreshed.candy_count == 0
+    assert refreshed.is_hidden is True
+
+
+def test_check_in_without_candy_count_never_hides_stop(client):
+    stop = _make_verified_stop(client)
+    assert stop.candy_count is None
+
+    response = client.post(
+        "/check-in",
+        json={
+            "device_id": "checker-1",
+            "stop_id": stop.id,
+            "latitude": stop.latitude,
+            "longitude": stop.longitude,
+        },
+    )
+
+    assert response.status_code == 200
+    refreshed = db.session.get(Stop, stop.id)
+    assert refreshed.candy_count is None
+    assert refreshed.is_hidden is False
+
+
+# ── Check-in milestone ───────────────────────────────────────────────────
+
+
+def test_check_in_includes_milestone_on_twentieth_checkin(client):
+    device_id = "milestone-chaser"
+
+    for i in range(20):
+        stop = _make_verified_stop(client, device_id=f"registrant-{i}", lat=42.0 + i * 0.01, lon=-71.0)
+        response = client.post(
+            "/check-in",
+            json={
+                "device_id": device_id,
+                "stop_id": stop.id,
+                "latitude": stop.latitude,
+                "longitude": stop.longitude,
+            },
+        )
+        assert response.status_code == 200
+        body = response.get_json()
+        if i < 19:
+            assert "milestone" not in body
+        else:
+            assert body["milestone"] is True
+            assert "20" in body["message"]
