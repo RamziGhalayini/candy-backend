@@ -19,6 +19,16 @@ if os.path.exists(_source_db):
 
 os.environ["DATABASE_URL"] = "sqlite:///" + _test_db_path
 
+# Dummy R2 config so app.py builds a real (fake-credentialed) r2_client at
+# import time instead of leaving it None -- tests that exercise the upload
+# path monkeypatch app.r2_client itself, so no real network call is ever
+# made against these fake credentials.
+os.environ.setdefault("R2_ACCOUNT_ID", "test-account")
+os.environ.setdefault("R2_ACCESS_KEY_ID", "test-access-key")
+os.environ.setdefault("R2_SECRET_ACCESS_KEY", "test-secret-key")
+os.environ.setdefault("R2_BUCKET_NAME", "test-bucket")
+os.environ.setdefault("R2_PUBLIC_BASE_URL", "https://pub-test.r2.dev")
+
 import pytest  # noqa: E402
 
 from app import _run_lightweight_migrations, app as flask_app, db  # noqa: E402

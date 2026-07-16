@@ -16,8 +16,11 @@ import json
 import math
 import os
 import secrets
+import uuid
 from datetime import date, datetime, timezone
 
+import boto3
+from botocore.exceptions import BotoCoreError, ClientError
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
@@ -39,6 +42,44 @@ else:
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db = SQLAlchemy(app)
+
+# House Greetings audio storage (Cloudflare R2, S3-compatible). Render's free
+# tier has no persistent disk -- files written locally get wiped on every
+# redeploy -- so greeting clips live in R2 and Stop.greeting_audio_url just
+# stores the public URL.
+R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID")
+R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID")
+R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY")
+R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME")
+R2_PUBLIC_BASE_URL = os.environ.get("R2_PUBLIC_BASE_URL", "").rstrip("/")
+
+if R2_ACCOUNT_ID and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY:
+    r2_client = boto3.client(
+        "s3",
+        endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        region_name="auto",
+    )
+else:
+    r2_client = None
+
+MAX_GREETING_BYTES = 2 * 1024 * 1024
+ALLOWED_GREETING_CONTENT_TYPES = {
+    "audio/m4a",
+    "audio/mp4",
+    "audio/x-m4a",
+    "audio/mpeg",
+    "audio/wav",
+    "audio/x-wav",
+    "audio/webm",
+    "audio/aac",
+}
+ALLOWED_GREETING_EXTENSIONS = {".m4a", ".mp3", ".wav", ".webm", ".aac", ".caf"}
+
+# Hard backstop above MAX_GREETING_BYTES (accounts for multipart overhead) --
+# rejects oversized request bodies before Flask even buffers them into memory.
+app.config["MAX_CONTENT_LENGTH"] = 3 * 1024 * 1024
 
 # How close two stops' lat/lon must be (in degrees) to be considered the
 # same physical address, since we don't have real addresses yet.
@@ -404,6 +445,49 @@ def update_candy_status(stop_id):
         return jsonify({"error": "stop not found"}), 404
 
     stop.candy_available = available
+    db.session.commit()
+
+    return jsonify(stop.to_dict())
+
+
+@app.route("/upload-greeting/<int:stop_id>", methods=["POST"])
+def upload_greeting(stop_id):
+    stop = db.session.get(Stop, stop_id)
+    if stop is None:
+        return jsonify({"error": "stop not found"}), 404
+
+    if r2_client is None:
+        return jsonify({"error": "greeting storage is not configured"}), 500
+
+    audio_file = request.files.get("audio")
+    if audio_file is None or audio_file.filename == "":
+        return jsonify({"error": "an audio file is required"}), 400
+
+    extension = os.path.splitext(audio_file.filename)[1].lower()
+    content_type = (audio_file.mimetype or "").lower()
+    if content_type not in ALLOWED_GREETING_CONTENT_TYPES and extension not in ALLOWED_GREETING_EXTENSIONS:
+        return jsonify({"error": "file must be an audio recording"}), 400
+
+    audio_bytes = audio_file.read()
+    if not audio_bytes:
+        return jsonify({"error": "audio file is empty"}), 400
+    if len(audio_bytes) > MAX_GREETING_BYTES:
+        max_mb = MAX_GREETING_BYTES // (1024 * 1024)
+        return jsonify({"error": f"audio file must be under {max_mb}MB"}), 400
+
+    key = f"greetings/{stop_id}-{uuid.uuid4().hex}{extension or '.m4a'}"
+
+    try:
+        r2_client.put_object(
+            Bucket=R2_BUCKET_NAME,
+            Key=key,
+            Body=audio_bytes,
+            ContentType=content_type or "audio/m4a",
+        )
+    except (BotoCoreError, ClientError):
+        return jsonify({"error": "could not upload audio, please try again"}), 502
+
+    stop.greeting_audio_url = f"{R2_PUBLIC_BASE_URL}/{key}"
     db.session.commit()
 
     return jsonify(stop.to_dict())

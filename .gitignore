@@ -4,3 +4,4 @@ candy.db
 candy.db.bak
 server.log
 server.err.log
+.env.local
