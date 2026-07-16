@@ -6,6 +6,11 @@
 # alongside db.create_all() at startup, ALTER TABLEs them in for any stop
 # table that predates this change; existing rows get the column defaults
 # (report_count=0, is_hidden=false). No data migration/backfill is needed.
+#
+# Wholly new tables (e.g. "business") need no entry here at all -- create_all()
+# already creates any table that doesn't exist yet, on both fresh and
+# pre-existing databases. _run_lightweight_migrations() only earns its keep
+# for columns bolted onto a table create_all() has already made.
 
 import json
 import math
@@ -146,6 +151,39 @@ class Redemption(db.Model):
     points_spent = db.Column(db.Integer, nullable=False)
     code = db.Column(db.String, nullable=False, unique=True)
     created_at = db.Column(db.DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
+
+
+class Business(db.Model):
+    """A locally registered business offering a reward, anonymous like Stop
+    -- keyed by registrant device_id, no accounts. Deliberately separate from
+    Stop: businesses aren't candy stops, and this flow has no verification/
+    hiding/candy-count machinery (yet)."""
+
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String, nullable=False)
+    address = db.Column(db.String, nullable=True)
+    latitude = db.Column(db.Float, nullable=False)
+    longitude = db.Column(db.Float, nullable=False)
+    category = db.Column(db.String, nullable=False)
+    description = db.Column(db.String, nullable=False)
+    contact_email = db.Column(db.String, nullable=False)
+    reward_offer = db.Column(db.String, nullable=False)
+    device_id = db.Column(db.String, nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "name": self.name,
+            "address": self.address,
+            "latitude": self.latitude,
+            "longitude": self.longitude,
+            "category": self.category,
+            "description": self.description,
+            "contact_email": self.contact_email,
+            "reward_offer": self.reward_offer,
+            "created_at": self.created_at.isoformat(),
+        }
 
 
 def _run_lightweight_migrations():
@@ -426,6 +464,83 @@ def check_in():
         )
 
     return jsonify(result)
+
+
+@app.route("/register-business", methods=["POST"])
+def register_business():
+    data = request.get_json(silent=True) or {}
+
+    name = data.get("name")
+    address = data.get("address")
+    latitude = data.get("latitude")
+    longitude = data.get("longitude")
+    category = data.get("category")
+    description = data.get("description")
+    contact_email = data.get("contact_email")
+    reward_offer = data.get("reward_offer")
+    device_id = data.get("device_id")
+
+    required = {
+        "name": name,
+        "latitude": latitude,
+        "longitude": longitude,
+        "category": category,
+        "description": description,
+        "contact_email": contact_email,
+        "reward_offer": reward_offer,
+        "device_id": device_id,
+    }
+    missing = [field for field, value in required.items() if value is None]
+    if missing:
+        return jsonify({"error": f"missing required field(s): {', '.join(missing)}"}), 400
+
+    try:
+        latitude = float(latitude)
+        longitude = float(longitude)
+    except (TypeError, ValueError):
+        return jsonify({"error": "latitude and longitude must be numbers"}), 400
+
+    business = Business(
+        name=name,
+        address=address,
+        latitude=latitude,
+        longitude=longitude,
+        category=category,
+        description=description,
+        contact_email=contact_email,
+        reward_offer=reward_offer,
+        device_id=device_id,
+    )
+    db.session.add(business)
+    db.session.commit()
+
+    return jsonify(business.to_dict()), 201
+
+
+@app.route("/nearby-businesses", methods=["GET"])
+def nearby_businesses():
+    lat = request.args.get("lat")
+    lon = request.args.get("lon")
+    radius = request.args.get("radius", default=1.0, type=float)
+
+    if lat is None or lon is None:
+        return jsonify({"error": "lat and lon query params are required"}), 400
+
+    try:
+        lat = float(lat)
+        lon = float(lon)
+    except ValueError:
+        return jsonify({"error": "lat and lon must be numbers"}), 400
+
+    nearby = []
+    for business in Business.query.all():
+        distance = haversine_distance_km(lat, lon, business.latitude, business.longitude)
+        if distance <= radius:
+            nearby.append({**business.to_dict(), "distance_km": round(distance, 3)})
+
+    nearby.sort(key=lambda b: b["distance_km"])
+
+    return jsonify(nearby)
 
 
 @app.route("/trivia/today", methods=["GET"])
