@@ -94,6 +94,12 @@ TRIVIA_POINTS = 10
 CHECKIN_RADIUS_METERS = 75
 CHECKIN_MILESTONE_INTERVAL = 20
 
+# Business rewards are business-set (Business.points_cost, entered at
+# registration) so an owner can price their own offer; this is the fallback
+# for businesses that leave it blank, roughly matched to the existing
+# static catalog's local_business entry (30 points).
+BUSINESS_REWARD_DEFAULT_POINTS_COST = 25
+
 basedir = os.path.abspath(os.path.dirname(__file__))
 with open(os.path.join(basedir, "trivia_questions.json")) as f:
     TRIVIA_QUESTIONS = json.load(f)
@@ -210,7 +216,11 @@ class Business(db.Model):
     contact_email = db.Column(db.String, nullable=False)
     reward_offer = db.Column(db.String, nullable=False)
     device_id = db.Column(db.String, nullable=True)
+    points_cost = db.Column(db.Integer, nullable=True)
     created_at = db.Column(db.DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
+
+    def resolved_points_cost(self):
+        return self.points_cost if self.points_cost is not None else BUSINESS_REWARD_DEFAULT_POINTS_COST
 
     def to_dict(self):
         return {
@@ -223,7 +233,18 @@ class Business(db.Model):
             "description": self.description,
             "contact_email": self.contact_email,
             "reward_offer": self.reward_offer,
+            "points_cost": self.resolved_points_cost(),
             "created_at": self.created_at.isoformat(),
+        }
+
+    def reward_catalog_entry(self):
+        return {
+            "id": f"business-{self.id}",
+            "name": self.reward_offer,
+            "points_cost": self.resolved_points_cost(),
+            "sponsor_name": self.name,
+            "sponsor_type": "local_business",
+            "image_url": "",
         }
 
 
@@ -272,6 +293,14 @@ def _run_lightweight_migrations():
                         "ALTER TABLE household ADD COLUMN greetings_unlocked "
                         "BOOLEAN NOT NULL DEFAULT FALSE"
                     )
+                )
+
+    if "business" in table_names:
+        existing_columns = {col["name"] for col in inspector.get_columns("business")}
+        with db.engine.begin() as connection:
+            if "points_cost" not in existing_columns:
+                connection.execute(
+                    text("ALTER TABLE business ADD COLUMN points_cost INTEGER")
                 )
 
 
@@ -384,11 +413,28 @@ def register_stop():
     return jsonify(stop.to_dict()), 201
 
 
+class _InvalidRadius(ValueError):
+    pass
+
+
+def _parse_radius_km(args):
+    """Flask's request.args.get(..., type=float) silently falls back to the
+    default on a parse failure instead of erroring -- a malformed radius
+    (empty string, a comma, etc.) would otherwise quietly search 1km instead
+    of what the caller asked for. Parse it explicitly so bad input 400s."""
+    raw = args.get("radius")
+    if raw is None:
+        return 1.0
+    try:
+        return float(raw)
+    except ValueError:
+        raise _InvalidRadius(raw)
+
+
 @app.route("/nearby-stops", methods=["GET"])
 def nearby_stops():
     lat = request.args.get("lat")
     lon = request.args.get("lon")
-    radius = request.args.get("radius", default=1.0, type=float)
 
     if lat is None or lon is None:
         return jsonify({"error": "lat and lon query params are required"}), 400
@@ -398,6 +444,11 @@ def nearby_stops():
         lon = float(lon)
     except ValueError:
         return jsonify({"error": "lat and lon must be numbers"}), 400
+
+    try:
+        radius = _parse_radius_km(request.args)
+    except _InvalidRadius:
+        return jsonify({"error": "radius must be a number"}), 400
 
     nearby = []
     for stop in Stop.query.filter_by(is_hidden=False).all():
@@ -602,6 +653,7 @@ def register_business():
     contact_email = data.get("contact_email")
     reward_offer = data.get("reward_offer")
     device_id = data.get("device_id")
+    points_cost = data.get("points_cost")
 
     required = {
         "name": name,
@@ -623,6 +675,10 @@ def register_business():
     except (TypeError, ValueError):
         return jsonify({"error": "latitude and longitude must be numbers"}), 400
 
+    if points_cost is not None:
+        if isinstance(points_cost, bool) or not isinstance(points_cost, int) or points_cost < 0:
+            return jsonify({"error": "points_cost must be a non-negative integer"}), 400
+
     business = Business(
         name=name,
         address=address,
@@ -633,6 +689,7 @@ def register_business():
         contact_email=contact_email,
         reward_offer=reward_offer,
         device_id=device_id,
+        points_cost=points_cost,
     )
     db.session.add(business)
     db.session.commit()
@@ -644,7 +701,6 @@ def register_business():
 def nearby_businesses():
     lat = request.args.get("lat")
     lon = request.args.get("lon")
-    radius = request.args.get("radius", default=1.0, type=float)
 
     if lat is None or lon is None:
         return jsonify({"error": "lat and lon query params are required"}), 400
@@ -654,6 +710,11 @@ def nearby_businesses():
         lon = float(lon)
     except ValueError:
         return jsonify({"error": "lat and lon must be numbers"}), 400
+
+    try:
+        radius = _parse_radius_km(request.args)
+    except _InvalidRadius:
+        return jsonify({"error": "radius must be a number"}), 400
 
     nearby = []
     for business in Business.query.all():
@@ -726,7 +787,27 @@ def trivia_answer():
 
 @app.route("/rewards-catalog", methods=["GET"])
 def rewards_catalog():
-    return jsonify(REWARDS_CATALOG)
+    business_entries = [business.reward_catalog_entry() for business in Business.query.all()]
+    return jsonify(REWARDS_CATALOG + business_entries)
+
+
+def _find_reward(reward_id):
+    """Look up a reward by id from either the static catalog or a
+    registered business's reward_offer (id shaped "business-<Business.id>")."""
+    reward = next((r for r in REWARDS_CATALOG if r["id"] == reward_id), None)
+    if reward is not None:
+        return reward
+
+    if reward_id.startswith("business-"):
+        try:
+            business_id = int(reward_id[len("business-") :])
+        except ValueError:
+            return None
+        business = db.session.get(Business, business_id)
+        if business is not None:
+            return business.reward_catalog_entry()
+
+    return None
 
 
 @app.route("/redeem-reward/<reward_id>", methods=["POST"])
@@ -737,9 +818,13 @@ def redeem_reward(reward_id):
     if not device_id:
         return jsonify({"error": "device_id is required"}), 400
 
-    reward = next((r for r in REWARDS_CATALOG if r["id"] == reward_id), None)
+    reward = _find_reward(reward_id)
     if reward is None:
         return jsonify({"error": "reward not found"}), 404
+
+    already_redeemed = Redemption.query.filter_by(device_id=device_id, reward_id=reward_id).first()
+    if already_redeemed is not None:
+        return jsonify({"error": "you've already redeemed this reward"}), 400
 
     household = Household.query.filter_by(device_id=device_id).first()
     if household is None or household.points < reward["points_cost"]:
@@ -759,6 +844,30 @@ def redeem_reward(reward_id):
     db.session.commit()
 
     return jsonify({"code": code, "points_remaining": household.points})
+
+
+@app.route("/redemptions/<device_id>", methods=["GET"])
+def get_redemptions(device_id):
+    redemptions = (
+        Redemption.query.filter_by(device_id=device_id).order_by(Redemption.created_at.desc()).all()
+    )
+
+    result = []
+    for redemption in redemptions:
+        reward = _find_reward(redemption.reward_id)
+        result.append(
+            {
+                "id": redemption.id,
+                "reward_id": redemption.reward_id,
+                "reward_name": reward["name"] if reward else redemption.reward_id,
+                "sponsor_name": reward["sponsor_name"] if reward else None,
+                "points_spent": redemption.points_spent,
+                "code": redemption.code,
+                "created_at": redemption.created_at.isoformat(),
+            }
+        )
+
+    return jsonify(result)
 
 
 @app.route("/points/<device_id>", methods=["GET"])

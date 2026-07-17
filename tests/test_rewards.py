@@ -242,6 +242,40 @@ def test_redeem_reward_unknown_id_returns_404(client):
     assert response.status_code == 404
 
 
+def test_redeem_reward_rejects_second_redemption_of_same_reward(client):
+    household = Household(device_id="repeat-redeemer", points=1000)
+    db.session.add(household)
+    db.session.commit()
+
+    reward = REWARDS_CATALOG[0]
+    payload = {"device_id": "repeat-redeemer"}
+
+    first = client.post(f"/redeem-reward/{reward['id']}", json=payload)
+    second = client.post(f"/redeem-reward/{reward['id']}", json=payload)
+
+    assert first.status_code == 200
+    assert second.status_code == 400
+    assert "already redeemed" in second.get_json()["error"]
+
+    # Points were only spent once.
+    assert db.session.get(Household, household.id).points == 1000 - reward["points_cost"]
+    assert Redemption.query.filter_by(device_id="repeat-redeemer", reward_id=reward["id"]).count() == 1
+
+
+def test_redeem_reward_allows_a_different_reward_after_first(client):
+    household = Household(device_id="multi-redeemer", points=1000)
+    db.session.add(household)
+    db.session.commit()
+
+    first_reward, second_reward = REWARDS_CATALOG[0], REWARDS_CATALOG[1]
+
+    first = client.post(f"/redeem-reward/{first_reward['id']}", json={"device_id": "multi-redeemer"})
+    second = client.post(f"/redeem-reward/{second_reward['id']}", json={"device_id": "multi-redeemer"})
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+
+
 def test_rewards_catalog_returns_seeded_list(client):
     response = client.get("/rewards-catalog")
 
@@ -402,3 +436,68 @@ def test_check_in_includes_milestone_on_twentieth_checkin(client):
         else:
             assert body["milestone"] is True
             assert "20" in body["message"]
+
+
+# ── Redemption history ───────────────────────────────────────────────────
+
+
+def test_get_redemptions_returns_empty_list_for_new_device(client):
+    response = client.get("/redemptions/never-redeemed")
+
+    assert response.status_code == 200
+    assert response.get_json() == []
+
+
+def test_get_redemptions_returns_history_with_expected_fields(client):
+    household = Household(device_id="history-1", points=1000)
+    db.session.add(household)
+    db.session.commit()
+
+    reward = REWARDS_CATALOG[0]
+    redeem_response = client.post(f"/redeem-reward/{reward['id']}", json={"device_id": "history-1"})
+    code = redeem_response.get_json()["code"]
+
+    response = client.get("/redemptions/history-1")
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert len(body) == 1
+    entry = body[0]
+    assert entry["reward_id"] == reward["id"]
+    assert entry["reward_name"] == reward["name"]
+    assert entry["sponsor_name"] == reward["sponsor_name"]
+    assert entry["points_spent"] == reward["points_cost"]
+    assert entry["code"] == code
+    assert "created_at" in entry
+
+
+def test_get_redemptions_sorted_most_recent_first(client):
+    household = Household(device_id="history-2", points=1000)
+    db.session.add(household)
+    db.session.commit()
+
+    first_reward, second_reward = REWARDS_CATALOG[0], REWARDS_CATALOG[1]
+    client.post(f"/redeem-reward/{first_reward['id']}", json={"device_id": "history-2"})
+    client.post(f"/redeem-reward/{second_reward['id']}", json={"device_id": "history-2"})
+
+    response = client.get("/redemptions/history-2")
+
+    body = response.get_json()
+    assert len(body) == 2
+    assert body[0]["reward_id"] == second_reward["id"]
+    assert body[1]["reward_id"] == first_reward["id"]
+
+
+def test_get_redemptions_only_returns_that_devices_history(client):
+    household_a = Household(device_id="history-a", points=1000)
+    household_b = Household(device_id="history-b", points=1000)
+    db.session.add_all([household_a, household_b])
+    db.session.commit()
+
+    reward = REWARDS_CATALOG[0]
+    client.post(f"/redeem-reward/{reward['id']}", json={"device_id": "history-a"})
+
+    response = client.get("/redemptions/history-b")
+
+    assert response.status_code == 200
+    assert response.get_json() == []
