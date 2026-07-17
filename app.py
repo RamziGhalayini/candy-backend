@@ -493,6 +493,45 @@ def upload_greeting(stop_id):
     return jsonify(stop.to_dict())
 
 
+@app.route("/my-stops/<device_id>", methods=["GET"])
+def my_stops(device_id):
+    stops = Stop.query.filter_by(registrant_device_id=device_id).all()
+    return jsonify([stop.to_dict() for stop in stops])
+
+
+@app.route("/update-stop/<int:stop_id>", methods=["PATCH"])
+def update_stop(stop_id):
+    data = request.get_json(silent=True) or {}
+
+    device_id = data.get("device_id")
+    if not device_id:
+        return jsonify({"error": "device_id is required"}), 400
+
+    stop = db.session.get(Stop, stop_id)
+    if stop is None:
+        return jsonify({"error": "stop not found"}), 404
+
+    if stop.registrant_device_id != device_id:
+        return jsonify({"error": "you can only edit stops you registered"}), 403
+
+    if "candy_count" in data:
+        candy_count = data["candy_count"]
+        if candy_count is not None:
+            if isinstance(candy_count, bool) or not isinstance(candy_count, int) or candy_count < 0:
+                return jsonify({"error": "candy_count must be a non-negative integer"}), 400
+        stop.candy_count = candy_count
+
+    if "candy_available" in data:
+        candy_available = data["candy_available"]
+        if not isinstance(candy_available, bool):
+            return jsonify({"error": "candy_available must be a boolean"}), 400
+        stop.candy_available = candy_available
+
+    db.session.commit()
+
+    return jsonify(stop.to_dict())
+
+
 @app.route("/check-in", methods=["POST"])
 def check_in():
     data = request.get_json(silent=True) or {}
