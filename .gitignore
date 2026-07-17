@@ -5,3 +5,6 @@ candy.db.bak
 server.log
 server.err.log
 .env.local
+
+# Claude Code local settings (machine-specific, not for the team)
+.claude/settings.local.json
