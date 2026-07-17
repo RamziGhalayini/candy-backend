@@ -640,6 +640,40 @@ def check_in():
     return jsonify(result)
 
 
+@app.route("/night-ledger/<device_id>", methods=["GET"])
+def night_ledger(device_id):
+    """A simple end-of-night recap: what this household checked into today,
+    and how many of the greetings they encountered they actually got to
+    hear. Deliberately scoped to today's CheckIn rows rather than tracking
+    anything new -- no separate "nearby but not visited" data model yet."""
+    today = date.today()
+    checkins_today = CheckIn.query.filter_by(device_id=device_id, check_in_date=today).all()
+    stop_ids = [checkin.stop_id for checkin in checkins_today]
+    stops = Stop.query.filter(Stop.id.in_(stop_ids)).all() if stop_ids else []
+
+    household = Household.query.filter_by(device_id=device_id).first()
+    greetings_unlocked = household.greetings_unlocked if household is not None else False
+
+    greetings_encountered = sum(1 for stop in stops if stop.greeting_audio_url)
+    # Check-in auto-plays every encountered greeting when unlocked, and plays
+    # none when locked -- so "heard" is just "encountered" gated on the flag,
+    # not tracked per-stop.
+    greetings_heard = greetings_encountered if greetings_unlocked else 0
+
+    return jsonify(
+        {
+            "device_id": device_id,
+            "date": today.isoformat(),
+            "total_checkins": len(checkins_today),
+            "verified_stops_checked_in": sum(1 for stop in stops if stop.is_verified()),
+            "candy_available_count": sum(1 for stop in stops if stop.candy_available),
+            "greetings_encountered": greetings_encountered,
+            "greetings_heard": greetings_heard,
+            "greetings_unlocked": greetings_unlocked,
+        }
+    )
+
+
 @app.route("/register-business", methods=["POST"])
 def register_business():
     data = request.get_json(silent=True) or {}
