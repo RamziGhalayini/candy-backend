@@ -20,12 +20,14 @@ import os
 import secrets
 import uuid
 from datetime import date, datetime, timezone
+from typing import List
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
+from pydantic import BaseModel as PydanticBaseModel, Field, ValidationError, field_validator
 from sqlalchemy import inspect, text
 
 import legend_token
@@ -653,41 +655,64 @@ def update_stop(stop_id):
     return jsonify(stop.to_dict())
 
 
-@app.route("/check-in", methods=["POST"])
-def check_in():
-    data = request.get_json(silent=True) or {}
+def _apply_check_in(device_id, stop_id, latitude, longitude, check_in_date):
+    """Shared validation + side-effect logic for BOTH POST /check-in (real
+    time) and POST /check-in/batch (offline-first sync) -- the two must
+    never diverge on what counts as valid, what gets awarded, or what
+    counts as an idempotent no-op, so both call this and only differ in
+    how they shape their own HTTP response around the result.
 
-    device_id = data.get("device_id")
-    stop_id = data.get("stop_id")
-    latitude = data.get("latitude")
-    longitude = data.get("longitude")
+    Returns a dict with a "status" key:
+      "accepted"          -- newly recorded; points_awarded/points_total/
+                              (optionally) milestone/message are set.
+      "already_recorded"  -- a CheckIn already exists for this exact
+                              (device_id, stop_id, check_in_date) -- a
+                              no-op, not an error. This IS this project's
+                              idempotency mechanism (see CheckIn's own
+                              UniqueConstraint) -- it's what makes "the
+                              same check-in submitted twice, once live and
+                              once via a delayed batch" resolve safely:
+                              whichever arrives second just finds this
+                              row already here and does nothing further.
+      "rejected"           -- invalid, with a machine-readable "reason"
+                              and a human-readable "error". "reason" is
+                              what lets a caller distinguish e.g.
+                              stop_unavailable (ran out/auto-hidden --
+                              the honest "this stop ran out before your
+                              check-in could sync" case) from
+                              stop_not_found (never existed at all),
+                              which the single real-time route doesn't
+                              need to distinguish (both were always a
+                              generic 404 there) but an offline batch
+                              sync does.
 
-    if not device_id or stop_id is None or latitude is None or longitude is None:
-        return jsonify({"error": "device_id, stop_id, latitude, and longitude are required"}), 400
-
+    Only the "accepted" path ever mutates the database, and does so
+    completely (CheckIn row + points + candy_count) before returning --
+    "rejected"/"already_recorded" never partially commit anything.
+    """
     try:
         latitude = float(latitude)
         longitude = float(longitude)
     except (TypeError, ValueError):
-        return jsonify({"error": "latitude and longitude must be numbers"}), 400
+        return {"status": "rejected", "reason": "invalid_coordinates", "error": "latitude and longitude must be numbers"}
 
     stop = db.session.get(Stop, stop_id)
-    if stop is None or stop.is_hidden:
-        return jsonify({"error": "stop not found"}), 404
-
+    if stop is None:
+        return {"status": "rejected", "reason": "stop_not_found", "error": "stop not found"}
+    if stop.is_hidden:
+        return {"status": "rejected", "reason": "stop_unavailable", "error": "stop not found"}
     if not stop.is_verified():
-        return jsonify({"error": "this stop isn't verified yet"}), 400
+        return {"status": "rejected", "reason": "not_verified", "error": "this stop isn't verified yet"}
 
     distance_meters = haversine_distance_km(latitude, longitude, stop.latitude, stop.longitude) * 1000
     if distance_meters > CHECKIN_RADIUS_METERS:
-        return jsonify({"error": "you're too far from this stop to check in"}), 400
+        return {"status": "rejected", "reason": "too_far", "error": "you're too far from this stop to check in"}
 
-    today = date.today()
-    existing = CheckIn.query.filter_by(device_id=device_id, stop_id=stop_id, check_in_date=today).first()
+    existing = CheckIn.query.filter_by(device_id=device_id, stop_id=stop_id, check_in_date=check_in_date).first()
     if existing is not None:
-        return jsonify({"error": "already checked in at this stop today"}), 400
+        return {"status": "already_recorded"}
 
-    db.session.add(CheckIn(device_id=device_id, stop_id=stop_id, check_in_date=today))
+    db.session.add(CheckIn(device_id=device_id, stop_id=stop_id, check_in_date=check_in_date))
     household = _award_points(device_id, CHECKIN_POINTS)
 
     if stop.candy_count is not None:
@@ -699,7 +724,7 @@ def check_in():
 
     total_checkins = CheckIn.query.filter_by(device_id=device_id).count()
 
-    result = {"points_awarded": CHECKIN_POINTS, "points_total": household.points}
+    result = {"status": "accepted", "points_awarded": CHECKIN_POINTS, "points_total": household.points}
     if total_checkins % CHECKIN_MILESTONE_INTERVAL == 0:
         result["milestone"] = True
         result["message"] = (
@@ -707,7 +732,119 @@ def check_in():
             "ask for an extra piece, you've earned it!"
         )
 
-    return jsonify(result)
+    return result
+
+
+@app.route("/check-in", methods=["POST"])
+def check_in():
+    """Real-time check-in. External request/response contract is
+    UNCHANGED from before _apply_check_in existed -- same required
+    fields, same error messages/status codes, same success shape. Only
+    the internals are now shared with /check-in/batch."""
+    data = request.get_json(silent=True) or {}
+
+    device_id = data.get("device_id")
+    stop_id = data.get("stop_id")
+    latitude = data.get("latitude")
+    longitude = data.get("longitude")
+
+    if not device_id or stop_id is None or latitude is None or longitude is None:
+        return jsonify({"error": "device_id, stop_id, latitude, and longitude are required"}), 400
+
+    outcome = _apply_check_in(device_id, stop_id, latitude, longitude, date.today())
+
+    if outcome["status"] == "already_recorded":
+        # Preserves this route's own pre-existing wording exactly (a
+        # duplicate live check-in reads differently than a delayed batch
+        # arriving after the fact already has -- see check_in_batch,
+        # which treats the identical outcome as a silent no-op instead).
+        return jsonify({"error": "already checked in at this stop today"}), 400
+
+    if outcome["status"] == "rejected":
+        status_code = 404 if outcome["reason"] in ("stop_not_found", "stop_unavailable") else 400
+        return jsonify({"error": outcome["error"]}), status_code
+
+    return jsonify({k: v for k, v in outcome.items() if k != "status"})
+
+
+# One trick-or-treating night's worth of stops, generously -- caps how
+# much work a single offline sync can ask the server to do at once.
+CHECKIN_BATCH_MAX_ITEMS = 50
+
+
+class _BatchCheckInItem(PydanticBaseModel):
+    stop_id: int
+    latitude: float
+    longitude: float
+    checked_in_at: datetime
+
+
+class _CheckInBatchPayload(PydanticBaseModel):
+    device_id: str = Field(min_length=1)
+    checkins: List[_BatchCheckInItem] = Field(min_length=1, max_length=CHECKIN_BATCH_MAX_ITEMS)
+
+    @field_validator("checkins")
+    @classmethod
+    def _validate_batch_shape(cls, items):
+        seen_stop_ids = set()
+        for index, item in enumerate(items):
+            if item.stop_id in seen_stop_ids:
+                raise ValueError(f"duplicate stop_id {item.stop_id} within the same batch")
+            seen_stop_ids.add(item.stop_id)
+            if index > 0 and item.checked_in_at < items[index - 1].checked_in_at:
+                raise ValueError("checkins must be submitted in chronological order")
+        return items
+
+
+@app.route("/check-in/batch", methods=["POST"])
+def check_in_batch():
+    """Offline-first sync: accepts check-ins captured while the device had
+    no connectivity, and applies each one through the EXACT SAME
+    validation/side-effect path as real-time /check-in (_apply_check_in)
+    -- a check-in that already succeeded live (or via an earlier partial
+    batch sync) is a no-op here, not a double-award, using CheckIn's own
+    (device_id, stop_id, check_in_date) unique constraint as the
+    idempotency key -- see _apply_check_in's own doc comment.
+
+    check_in_date for each item comes from ITS OWN checked_in_at (when the
+    check-in actually happened on-device), never from today's date at
+    sync time -- a check-in captured at 11:58pm and synced after midnight
+    still counts for the night it occurred, not the night it happened to
+    reach the server.
+
+    Unlike the single route, "stop_unavailable" (the stop ran out/got
+    auto-hidden between capture and sync) is reported with its own
+    distinct reason rather than folded into a generic 404 -- this is
+    exactly the honest "this stop ran out before your check-in could
+    sync" case, which only matters for a delayed sync, never for a
+    real-time check-in."""
+    raw_data = request.get_json(silent=True) or {}
+    try:
+        payload = _CheckInBatchPayload.model_validate(raw_data)
+    except ValidationError as error:
+        # include_context=False: a custom field_validator's plain
+        # ValueError lands in errors()'s "ctx" as the raw exception OBJECT,
+        # not a string -- confirmed by an actual failing test here (both
+        # the duplicate-stop_id and non-chronological-order validators
+        # raise ValueError), which is not JSON-serializable and 500'd on
+        # the jsonify() call below before this fix. include_url=False
+        # just drops a docs link this client-facing response has no use
+        # for.
+        detail = error.errors(include_context=False, include_url=False)
+        return jsonify({"error": "invalid batch payload", "detail": detail}), 400
+
+    results = []
+    for item in payload.checkins:
+        outcome = _apply_check_in(
+            payload.device_id,
+            item.stop_id,
+            item.latitude,
+            item.longitude,
+            item.checked_in_at.date(),
+        )
+        results.append({"stop_id": item.stop_id, **outcome})
+
+    return jsonify({"results": results})
 
 
 @app.route("/night-ledger/<device_id>", methods=["GET"])
