@@ -12,6 +12,8 @@
 # pre-existing databases. _run_lightweight_migrations() only earns its keep
 # for columns bolted onto a table create_all() has already made.
 
+import hashlib
+import hmac
 import json
 import math
 import os
@@ -25,6 +27,14 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import inspect, text
+
+import legend_token
+from apple_verification import AppleVerificationConfigError, AppleVerificationError, verify_transaction
+
+# Must match the client's LEGEND_MODE_SKU (constants/legendMode.ts) exactly --
+# the two live in separate repos with no shared source of truth, so a drift
+# here would silently make every mint call fail its product-id check.
+LEGEND_MODE_PRODUCT_ID = "com.treatmapapp.candystops.legendmode"
 
 app = Flask(__name__)
 CORS(app)
@@ -200,6 +210,43 @@ class Redemption(db.Model):
     created_at = db.Column(db.DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
 
 
+class LegendUnlock(db.Model):
+    """A restore code tied to the device whose StoreKit purchase unlocked
+    Legend Mode -- lets that device (or a reinstall of it) recover
+    legendModeActive locally without going through the App Store again.
+    No accounts, so the code itself is the credential: whoever holds it can
+    redeem it, same tradeoff as Redemption.code above. One code per
+    device_id, minted once and returned again on repeat mint calls.
+
+    HASH-BASED STORAGE (added alongside real Apple purchase verification --
+    see mint_legend_code): `code` is the ORIGINAL raw-code column, kept only
+    for rows minted before this change (grandfathered -- redeem still
+    honors them by hash match, and their `code` value is what code_hash was
+    backfilled from; see _run_lightweight_migrations). `code` remains
+    NOT NULL at the database level -- SQLite cannot relax an existing
+    column's NOT NULL constraint without a full table rebuild (this
+    project's own _run_lightweight_migrations pattern only ever ADDS
+    columns for exactly this reason), so a real schema change to make it
+    nullable was out of scope for this pass. For NEW rows minted under the
+    hash-only scheme, `code` is set to the SAME value as `code_hash` --
+    the actual raw code is never computed into this column for new rows,
+    only its hash, duplicated to satisfy the pre-existing NOT NULL+UNIQUE
+    constraints without any risk to the constraint itself (a hash has
+    negligible collision probability, same as any unique token already
+    stored here). `transaction_id` is null for grandfathered rows and set
+    for every row minted under the new scheme; enforced unique at the
+    application layer (an explicit query before insert in mint_legend_code)
+    rather than a DB-level constraint, since retrofitting a UNIQUE index
+    via ALTER TABLE onto SQLite hits the same rebuild limitation."""
+
+    id = db.Column(db.Integer, primary_key=True)
+    device_id = db.Column(db.String, nullable=False, unique=True, index=True)
+    code = db.Column(db.String, nullable=False, unique=True, index=True)
+    transaction_id = db.Column(db.String, nullable=True, index=True)
+    code_hash = db.Column(db.String, nullable=True, index=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
+
+
 class Business(db.Model):
     """A locally registered business offering a reward, anonymous like Stop
     -- keyed by registrant device_id, no accounts. Deliberately separate from
@@ -302,6 +349,29 @@ def _run_lightweight_migrations():
                 connection.execute(
                     text("ALTER TABLE business ADD COLUMN points_cost INTEGER")
                 )
+
+    if "legend_unlock" in table_names:
+        existing_columns = {col["name"] for col in inspector.get_columns("legend_unlock")}
+        with db.engine.begin() as connection:
+            if "transaction_id" not in existing_columns:
+                connection.execute(
+                    text("ALTER TABLE legend_unlock ADD COLUMN transaction_id VARCHAR")
+                )
+            if "code_hash" not in existing_columns:
+                connection.execute(
+                    text("ALTER TABLE legend_unlock ADD COLUMN code_hash VARCHAR")
+                )
+        # Backfill, not just a static default: every row minted before this
+        # change has a real `code` already sitting there (nothing discarded,
+        # nothing guessed) -- this derives code_hash from it directly, once,
+        # for any row that doesn't have one yet. Safe to run on every
+        # startup: rows that already have code_hash are excluded by the
+        # filter, so repeat runs touch zero rows.
+        rows_needing_backfill = LegendUnlock.query.filter(LegendUnlock.code_hash.is_(None)).all()
+        for row in rows_needing_backfill:
+            row.code_hash = hashlib.sha256(row.code.encode()).hexdigest()
+        if rows_needing_backfill:
+            db.session.commit()
 
 
 with app.app_context():
@@ -910,6 +980,102 @@ def get_points(device_id):
     points = household.points if household is not None else 0
     greetings_unlocked = household.greetings_unlocked if household is not None else False
     return jsonify({"device_id": device_id, "points": points, "greetings_unlocked": greetings_unlocked})
+
+
+@app.route("/legend-mode/mint", methods=["POST"])
+def mint_legend_code():
+    """Called by the client after a StoreKit purchase completes. Requires
+    real proof of that purchase -- transaction_id, verified against
+    Apple's App Store Server API via apple_verification.verify_transaction
+    -- rather than trusting the client's bare say-so (the previous,
+    deliberately-low-security version of this endpoint took only
+    device_id). Idempotent per device_id: a device that already has a code
+    gets the SAME code back. For a row minted under this scheme, that code
+    is RECOMPUTED from its stored transaction_id (see legend_token --
+    deterministic HMAC, not a stored raw value); for a grandfathered row
+    from before this change, its original `code` is returned as before."""
+    data = request.get_json(silent=True) or {}
+
+    device_id = data.get("device_id")
+    transaction_id = data.get("transaction_id")
+    if not device_id:
+        return jsonify({"error": "device_id is required"}), 400
+    if not transaction_id:
+        return jsonify({"error": "transaction_id is required"}), 400
+
+    existing = LegendUnlock.query.filter_by(device_id=device_id).first()
+    if existing is not None:
+        if existing.transaction_id:
+            return jsonify(
+                {"code": legend_token.generate_legend_code(existing.device_id, existing.transaction_id)}
+            )
+        return jsonify({"code": existing.code})
+
+    # One transaction can only ever mint one device's code -- otherwise a
+    # single real purchase's transaction_id could be replayed to mint
+    # codes for arbitrary other device_ids. Application-layer check (see
+    # LegendUnlock's own doc comment for why this isn't a DB constraint).
+    if LegendUnlock.query.filter_by(transaction_id=transaction_id).first() is not None:
+        return jsonify({"error": "that transaction has already been used to unlock Legend Mode"}), 409
+
+    try:
+        verify_transaction(transaction_id, LEGEND_MODE_PRODUCT_ID)
+    except AppleVerificationConfigError as error:
+        # Server misconfiguration (missing credentials), not the client's
+        # fault -- the real reason goes to the log, not the response body.
+        app.logger.error("Apple verification not configured: %s", error)
+        return jsonify({"error": "purchase verification is temporarily unavailable"}), 500
+    except AppleVerificationError as error:
+        # Generic to the client, detailed in the log -- same
+        # no-system-state-leakage principle as redeem's error responses.
+        app.logger.warning("Purchase verification failed for transaction %s: %s", transaction_id, error)
+        return jsonify({"error": "could not verify that purchase"}), 403
+
+    code = legend_token.generate_legend_code(device_id, transaction_id)
+    code_hash = legend_token.hash_code(code)
+    db.session.add(
+        LegendUnlock(
+            device_id=device_id,
+            # NOT the raw code -- see LegendUnlock's own doc comment for
+            # why this column still exists and still can't be null.
+            code=code_hash,
+            transaction_id=transaction_id,
+            code_hash=code_hash,
+        )
+    )
+    db.session.commit()
+
+    return jsonify({"code": code})
+
+
+@app.route("/legend-mode/redeem", methods=["POST"])
+def redeem_legend_code():
+    """Validates a restore code and reports back whether it's real. The
+    client is the one that actually sets legendModeActive locally -- this
+    endpoint has no per-device state to update, since redemption doesn't
+    consume or transfer anything server-side.
+
+    External behavior (request/response shape, status codes) is unchanged
+    from before this pass. Internally, this now looks up by SHA-256 hash
+    rather than the raw code -- hashing the submitted guess FIRST already
+    defeats the character-by-character partial-match timing signal
+    hmac.compare_digest exists to prevent (a near-miss guess produces a
+    completely different hash, not a partial match), so that lookup is
+    doing the real work; the explicit compare_digest call below is real
+    defense-in-depth on the one row actually returned, not the sole
+    mechanism."""
+    data = request.get_json(silent=True) or {}
+
+    code = (data.get("code") or "").strip().upper()
+    if not code:
+        return jsonify({"error": "code is required"}), 400
+
+    submitted_hash = legend_token.hash_code(code)
+    unlock = LegendUnlock.query.filter_by(code_hash=submitted_hash).first()
+    if unlock is None or not hmac.compare_digest(unlock.code_hash, submitted_hash):
+        return jsonify({"error": "that code is not valid"}), 404
+
+    return jsonify({"legend_mode_active": True})
 
 
 if __name__ == "__main__":

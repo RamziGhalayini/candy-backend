@@ -29,6 +29,12 @@ os.environ.setdefault("R2_SECRET_ACCESS_KEY", "test-secret-key")
 os.environ.setdefault("R2_BUCKET_NAME", "test-bucket")
 os.environ.setdefault("R2_PUBLIC_BASE_URL", "https://pub-test.r2.dev")
 
+# Same reasoning as the R2 dummies above: legend_token.generate_legend_code
+# needs SOME pepper to run at all (it's real code, not mocked -- only the
+# Apple network call is mocked in tests/test_legend_mode.py), and a fixed
+# test value keeps mint's output reproducible across test runs.
+os.environ.setdefault("LEGEND_CODE_PEPPER", "test-pepper-do-not-use-in-prod")
+
 import pytest  # noqa: E402
 
 from app import _run_lightweight_migrations, app as flask_app, db  # noqa: E402
