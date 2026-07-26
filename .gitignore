@@ -2,6 +2,16 @@ venv/
 __pycache__/
 candy.db
 candy.db.bak
+# Local test copy (see the test-against-a-copy workflow). Same content class
+# as candy.db above -- real rows, device ids -- and this repo is public.
+candy_local_test.db
+
+# Local DB-URL helper. No credential is embedded in it -- it resolves the
+# URL at runtime -- but a utility whose whole job is printing a database
+# URL does not belong in a public repo, and it is a local convenience
+# rather than something the project needs.
+_print_db_url.py
+
 server.log
 server.err.log
 .env.local
