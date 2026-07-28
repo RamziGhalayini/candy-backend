@@ -19,8 +19,8 @@ import math
 import os
 import secrets
 import uuid
-from datetime import date, datetime, timezone
-from typing import List
+from datetime import date, datetime, timedelta, timezone
+from typing import List, Optional
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
@@ -655,6 +655,72 @@ def update_stop(stop_id):
     return jsonify(stop.to_dict())
 
 
+# --- Which night does a check-in belong to? ---------------------------------
+#
+# A check-in belongs to the night the trick-or-treater actually experienced,
+# which is a LOCAL calendar date, not a UTC one. The client sends the UTC offset
+# it had AT THE MOMENT the check-in happened, and that offset picks the date.
+#
+# Sign convention: minutes EAST of UTC -- the number of minutes to ADD to UTC to
+# get local time, so US Eastern daylight time (UTC-4) is -240. This is the
+# INVERSE of JavaScript's Date#getTimezoneOffset(), which returns +240 for
+# UTC-4; the client negates once before sending (candy-app/utils/utcOffset.ts)
+# so both sides read the offset in the same direction.
+#
+# The offset is used and then DISCARDED -- it is never stored. check_in_date is
+# still the only thing that persists, and its shape is unchanged, so this needs
+# no schema change, no new column, and no backfill.
+#
+# It is also strictly OPTIONAL. Absent, malformed, or out of range all mean
+# "fall back to the previous UTC-derived behaviour", never "assume UTC" -- the
+# two differ, and falling back is what keeps existing rows valid and older
+# clients working exactly as they did before.
+
+# -12:00 (Etc/GMT+12) through +14:00 (Pacific/Kiritimati) spans every real zone.
+UTC_OFFSET_MIN_MINUTES = -12 * 60
+UTC_OFFSET_MAX_MINUTES = 14 * 60
+
+
+def _parse_utc_offset_minutes(raw):
+    """Returns a plausible offset in minutes, or None meaning "fall back".
+
+    This value is client-controlled and it feeds check_in_date, which is part
+    of the (device_id, stop_id, check_in_date) uniqueness key -- so it is range
+    checked rather than trusted. Within the accepted range the worst a client
+    can do is move its OWN check-in by at most a day, which the same uniqueness
+    key still de-duplicates; it cannot reach another device's rows.
+
+    bool is rejected explicitly: it is a subclass of int in Python, so True
+    would otherwise be read as a +1 minute offset.
+    """
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        minutes = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if not UTC_OFFSET_MIN_MINUTES <= minutes <= UTC_OFFSET_MAX_MINUTES:
+        return None
+    return minutes
+
+
+def _local_date_for(moment, utc_offset_minutes):
+    """The local calendar date `moment` falls on for a device at that offset.
+
+    The boundary is LOCAL MIDNIGHT, deliberately -- no rollover-hour constant.
+    The client already keys its own "already checked in here" cache on the plain
+    local calendar date (candy-app/utils/checkedInToday.ts). Any other boundary
+    here would make the client's guard and this server's idempotency key
+    disagree for part of every night, which is the exact shape of the
+    double-credit bug this work exists to prevent.
+
+    A naive `moment` is read as UTC, which is what it always was.
+    """
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return (moment.astimezone(timezone.utc) + timedelta(minutes=utc_offset_minutes)).date()
+
+
 def _apply_check_in(device_id, stop_id, latitude, longitude, check_in_date):
     """Shared validation + side-effect logic for BOTH POST /check-in (real
     time) and POST /check-in/batch (offline-first sync) -- the two must
@@ -751,7 +817,16 @@ def check_in():
     if not device_id or stop_id is None or latitude is None or longitude is None:
         return jsonify({"error": "device_id, stop_id, latitude, and longitude are required"}), 400
 
-    outcome = _apply_check_in(device_id, stop_id, latitude, longitude, date.today())
+    # utc_offset_minutes is optional and additive: a client that doesn't send it
+    # gets byte-identical behaviour to before. See _parse_utc_offset_minutes.
+    offset_minutes = _parse_utc_offset_minutes(data.get("utc_offset_minutes"))
+    check_in_date = (
+        date.today()
+        if offset_minutes is None
+        else _local_date_for(datetime.now(timezone.utc), offset_minutes)
+    )
+
+    outcome = _apply_check_in(device_id, stop_id, latitude, longitude, check_in_date)
 
     if outcome["status"] == "already_recorded":
         # Preserves this route's own pre-existing wording exactly (a
@@ -777,6 +852,18 @@ class _BatchCheckInItem(PydanticBaseModel):
     latitude: float
     longitude: float
     checked_in_at: datetime
+    # PER ITEM, not per batch: a queue drained after a DST change can hold
+    # check-ins captured under two different offsets, and each one must be
+    # resolved with the offset it had when it happened.
+    utc_offset_minutes: Optional[int] = None
+
+    @field_validator("utc_offset_minutes", mode="before")
+    @classmethod
+    def _normalise_offset(cls, raw):
+        # Normalise rather than raise: an unusable offset must never fail the
+        # whole batch (which would take 49 good check-ins down with it), it
+        # just falls back to the UTC-derived date for that one item.
+        return _parse_utc_offset_minutes(raw)
 
 
 class _CheckInBatchPayload(PydanticBaseModel):
@@ -835,12 +922,21 @@ def check_in_batch():
 
     results = []
     for item in payload.checkins:
+        # Both inputs come off the ITEM, never off the server clock or a
+        # device-reported "now" at sync time -- that is what makes a replay
+        # date-stable, and the offset has to be treated exactly like
+        # checked_in_at is or the DST-change case reopens the same hole.
+        item_date = (
+            item.checked_in_at.date()
+            if item.utc_offset_minutes is None
+            else _local_date_for(item.checked_in_at, item.utc_offset_minutes)
+        )
         outcome = _apply_check_in(
             payload.device_id,
             item.stop_id,
             item.latitude,
             item.longitude,
-            item.checked_in_at.date(),
+            item_date,
         )
         results.append({"stop_id": item.stop_id, **outcome})
 
@@ -853,7 +949,17 @@ def night_ledger(device_id):
     and how many of the greetings they encountered they actually got to
     hear. Deliberately scoped to today's CheckIn rows rather than tracking
     anything new -- no separate "nearby but not visited" data model yet."""
-    today = date.today()
+    # The read path needs the offset too, or the ledger still splits at UTC
+    # midnight and the user-visible half of the bug survives the write-path fix.
+    # Here the client's CURRENT offset is the right one -- "what does tonight
+    # look like right now" is a present-tense question, unlike a check-in, which
+    # is anchored to the moment it happened.
+    offset_minutes = _parse_utc_offset_minutes(request.args.get("utc_offset_minutes"))
+    today = (
+        date.today()
+        if offset_minutes is None
+        else _local_date_for(datetime.now(timezone.utc), offset_minutes)
+    )
     checkins_today = CheckIn.query.filter_by(device_id=device_id, check_in_date=today).all()
     stop_ids = [checkin.stop_id for checkin in checkins_today]
     stops = Stop.query.filter(Stop.id.in_(stop_ids)).all() if stop_ids else []
