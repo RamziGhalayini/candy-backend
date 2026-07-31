@@ -96,7 +96,23 @@ app.config["MAX_CONTENT_LENGTH"] = 3 * 1024 * 1024
 # How close two stops' lat/lon must be (in degrees) to be considered the
 # same physical address, since we don't have real addresses yet.
 VERIFICATION_TOLERANCE_DEGREES = 0.0005
-REPORT_HIDE_THRESHOLD = 3
+# How many reports hide a stop. Raised from 3 as a stopgap, NOT a fix.
+#
+# Reports are not deduplicated, so this is a count of requests, not of people.
+# Against anyone scripting it the number is irrelevant (3 requests or 30 is the
+# same effort with no rate limiting); its only real job is to resist casual
+# in-app abuse -- a few kids tapping "report" on a dare -- and honest
+# over-reporting.
+#
+# Kept deliberately low despite that, because this threshold is also the ONLY
+# moderation mechanism in the service: there is no admin route, no human
+# review, and hiding is permanent (nothing anywhere sets is_hidden back to
+# False, and report_count never resets). A stop hidden in error stays hidden,
+# and the owner is not told -- candy-app filters hidden stops out of the
+# owner's own list too, so it simply disappears. That cuts both ways: raising
+# this too far would slow the only lever for pulling a genuinely unsafe stop.
+# 5 roughly doubles the manual effort without blunting that lever.
+REPORT_HIDE_THRESHOLD = 5
 
 # Points economy. Households are anonymous, keyed only by an app-generated
 # device_id -- no accounts, no personal info.
