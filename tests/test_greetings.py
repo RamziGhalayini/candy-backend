@@ -20,8 +20,19 @@ def _register_stop(client, **overrides):
     return response.get_json()["id"]
 
 
-def _audio_file(name="greeting.m4a", content_type="audio/m4a", body=b"fake-audio-bytes"):
-    return {"audio": (io.BytesIO(body), name, content_type)}
+def _audio_file(
+    name="greeting.m4a",
+    content_type="audio/m4a",
+    body=b"fake-audio-bytes",
+    device_id="greeter-1",
+):
+    """Multipart payload for an upload. device_id defaults to the same device
+    _register_stop() registers with, so the ownership gate passes; pass a
+    different id (or None) to exercise the gate itself."""
+    data = {"audio": (io.BytesIO(body), name, content_type)}
+    if device_id is not None:
+        data["device_id"] = device_id
+    return data
 
 
 def test_upload_greeting_succeeds_and_sets_url(client, monkeypatch):
@@ -98,11 +109,12 @@ def test_upload_greeting_requires_a_file(client, monkeypatch):
 
     response = client.post(
         f"/upload-greeting/{stop_id}",
-        data={},
+        data={"device_id": "greeter-1"},
         content_type="multipart/form-data",
     )
 
     assert response.status_code == 400
+    assert "audio" in response.get_json()["error"]
 
 
 def test_upload_greeting_missing_stop_returns_404(client, monkeypatch):
@@ -132,6 +144,78 @@ def test_upload_greeting_returns_502_when_r2_upload_fails(client, monkeypatch):
     assert response.status_code == 502
     stored = db.session.get(Stop, stop_id)
     assert stored.greeting_audio_url is None
+
+
+def test_upload_greeting_rejects_a_stranger(client, monkeypatch):
+    """The security case. A greeting plays to children who check in at that
+    address, so only the household that registered the stop may set it."""
+    stop_id = _register_stop(client)
+    mock_r2 = MagicMock()
+    monkeypatch.setattr(app_module, "r2_client", mock_r2)
+
+    response = client.post(
+        f"/upload-greeting/{stop_id}",
+        data=_audio_file(device_id="not-the-owner"),
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 403
+    mock_r2.put_object.assert_not_called()
+    stored = db.session.get(Stop, stop_id)
+    assert stored.greeting_audio_url is None
+
+
+def test_upload_greeting_does_not_overwrite_an_existing_greeting(client, monkeypatch):
+    """Replacing a greeting already in place is the damaging version of the
+    same attack, so cover it separately from the first-upload case."""
+    stop_id = _register_stop(client)
+    monkeypatch.setattr(app_module, "r2_client", MagicMock())
+
+    client.post(
+        f"/upload-greeting/{stop_id}",
+        data=_audio_file(),
+        content_type="multipart/form-data",
+    )
+    original_url = db.session.get(Stop, stop_id).greeting_audio_url
+    assert original_url is not None
+
+    response = client.post(
+        f"/upload-greeting/{stop_id}",
+        data=_audio_file(body=b"malicious-audio", device_id="not-the-owner"),
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 403
+    assert db.session.get(Stop, stop_id).greeting_audio_url == original_url
+
+
+def test_upload_greeting_requires_a_device_id(client, monkeypatch):
+    stop_id = _register_stop(client)
+    monkeypatch.setattr(app_module, "r2_client", MagicMock())
+
+    response = client.post(
+        f"/upload-greeting/{stop_id}",
+        data=_audio_file(device_id=None),
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 400
+    assert "device_id" in response.get_json()["error"]
+
+
+def test_upload_greeting_rejected_for_a_stop_with_no_registrant(client, monkeypatch):
+    """A stop registered without a device_id has no owner to check against.
+    Fail closed rather than letting anyone claim it."""
+    stop_id = _register_stop(client, device_id=None)
+    monkeypatch.setattr(app_module, "r2_client", MagicMock())
+
+    response = client.post(
+        f"/upload-greeting/{stop_id}",
+        data=_audio_file(device_id="anyone-at-all"),
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 403
 
 
 def test_upload_greeting_not_configured_returns_500(client, monkeypatch):

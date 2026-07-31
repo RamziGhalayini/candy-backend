@@ -597,9 +597,24 @@ def update_candy_status(stop_id):
 
 @app.route("/upload-greeting/<int:stop_id>", methods=["POST"])
 def upload_greeting(stop_id):
+    # Multipart, so the device id rides in the form fields rather than a JSON
+    # body. Same ownership gate as /update-stop: the greeting is the
+    # household's own recording, and it plays to children who check in at that
+    # address, so a stranger must not be able to replace it.
+    device_id = request.form.get("device_id")
+    if not device_id:
+        return jsonify({"error": "device_id is required"}), 400
+
     stop = db.session.get(Stop, stop_id)
     if stop is None:
         return jsonify({"error": "stop not found"}), 404
+
+    # Fails closed for a stop with no registrant recorded (the column is
+    # nullable, and /register-stop does not require a device_id): None never
+    # equals a supplied id, so such a stop accepts no greeting at all. That
+    # matches how /update-stop already behaves.
+    if stop.registrant_device_id != device_id:
+        return jsonify({"error": "you can only add a greeting to stops you registered"}), 403
 
     if r2_client is None:
         return jsonify({"error": "greeting storage is not configured"}), 500
