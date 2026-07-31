@@ -552,7 +552,13 @@ def report_stop(stop_id):
         stop.is_hidden = True
     db.session.commit()
 
-    return jsonify(stop.to_dict())
+    # Deliberately NOT stop.to_dict() -- that carries the household's exact
+    # latitude and longitude. Reporting is open to strangers by design (that's
+    # the point of an abuse report), stop ids are sequential, and there is no
+    # rate limiting, so returning the record here let anyone walk the id space
+    # and harvest the coordinates of every registered home. A report needs no
+    # answer beyond "received".
+    return jsonify({"status": "reported"})
 
 
 @app.route("/update-candy-status/<int:stop_id>", methods=["PUT"])
