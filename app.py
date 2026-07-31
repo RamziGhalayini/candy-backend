@@ -577,22 +577,17 @@ def report_stop(stop_id):
     return jsonify({"status": "reported"})
 
 
-@app.route("/update-candy-status/<int:stop_id>", methods=["PUT"])
-def update_candy_status(stop_id):
-    data = request.get_json(silent=True) or {}
-
-    available = data.get("available")
-    if available is None or not isinstance(available, bool):
-        return jsonify({"error": "available (boolean) is required"}), 400
-
-    stop = db.session.get(Stop, stop_id)
-    if stop is None:
-        return jsonify({"error": "stop not found"}), 404
-
-    stop.candy_available = available
-    db.session.commit()
-
-    return jsonify(stop.to_dict())
+# PUT /update-candy-status was removed here. It wrote candy_available with no
+# ownership check, and its only caller was a "Candy" switch rendered on every
+# card in candy-app's nearby-stops list -- so any passer-by could mark any
+# household out of candy on the one night it matters.
+#
+# Gating it was not the answer: the people tapping it were, by design, not the
+# owner, so a gate would have 403'd every real caller. The owner already has a
+# gated path to the same field in PATCH /update-stop, and the crowd-sourced
+# "this house ran out" signal is already handled better by candy_count, which
+# decrements per check-in (proximity-checked, and genuinely deduplicated by
+# CheckIn's unique constraint) and hides the stop at zero.
 
 
 @app.route("/upload-greeting/<int:stop_id>", methods=["POST"])
