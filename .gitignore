@@ -14,7 +14,29 @@ _print_db_url.py
 
 server.log
 server.err.log
-.env.local
+
+# Local env files. .env.local was already listed here; the broader rules
+# below cover every sibling (.env, .env.production, ...) because this repo
+# is public and one mis-named file is enough.
+.env
+.env.*
+!.env.example
+
+# Private keys and signing material. Apple ships the App Store Server API
+# key as a .p8 -- that file must never reach a public repo, and it is the
+# single most likely thing to get dropped into certs/ next to the public
+# roots below. These patterns are unanchored, so they match at any depth,
+# including inside certs/.
+*.p8
+*.pem
+*.key
+*.p12
+*.jks
+
+# NOT ignored, deliberately: certs/*.cer. Those are Apple's public root
+# certificates (AppleIncRootCertificate.cer, AppleRootCA-G3.cer), which the
+# receipt-verification code needs at runtime and which carry no secret. No
+# rule above matches .cer, so certs/ keeps working as-is.
 
 # Claude Code local settings (machine-specific, not for the team)
 .claude/settings.local.json
