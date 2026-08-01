@@ -214,11 +214,13 @@ def test_batch_is_a_no_op_when_the_same_item_is_resynced_in_a_later_batch(client
 
 
 def test_batch_reports_stop_unavailable_distinctly_from_stop_not_found(client):
-    """The honest eventual-consistency case: a stop that ran out and got
-    auto-hidden between the offline tap and the eventual sync should
-    report a DIFFERENT reason than a stop that genuinely never existed --
-    the client needs this to show "this stop ran out before your check-in
-    could sync" specifically, not a generic error."""
+    """A stop hidden by reports between the offline tap and the eventual sync
+    should report a DIFFERENT reason than a stop that genuinely never existed,
+    so the client can say something specific rather than a generic error.
+
+    NOTE: stop_unavailable no longer covers "the house ran out" -- running out
+    sets candy_available = False and the check-in is accepted. See
+    test_batch_accepts_a_queued_check_in_at_a_stop_that_ran_out_later."""
     stop = _make_verified_stop(client)
     stop.is_hidden = True
     db.session.commit()
@@ -260,6 +262,41 @@ def test_batch_reports_stop_unavailable_distinctly_from_stop_not_found(client):
     nonexistent_result = nonexistent_response.get_json()["results"][0]
     assert nonexistent_result["reason"] == "stop_not_found"
     assert nonexistent_result["reason"] != result["reason"]
+
+
+def test_batch_accepts_a_queued_check_in_at_a_stop_that_ran_out_later(client):
+    """The offline case this change exists for: a kid taps check-in at a house
+    that still has candy, goes out of signal, and the house runs out before the
+    queue syncs. That check-in must still be credited -- the visit really
+    happened -- so running out must not reject it."""
+    stop = _make_verified_stop(client)
+    stop.candy_count = 0
+    stop.candy_available = False
+    db.session.commit()
+
+    response = client.post(
+        "/check-in/batch",
+        json={
+            "device_id": "offline-device",
+            "checkins": [
+                {
+                    "stop_id": stop.id,
+                    "latitude": stop.latitude,
+                    "longitude": stop.longitude,
+                    "checked_in_at": _iso(datetime.now(timezone.utc)),
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    result = response.get_json()["results"][0]
+    assert result["status"] == "accepted"
+
+    from app import Household
+
+    household = Household.query.filter_by(device_id="offline-device").first()
+    assert household.points == 5
 
 
 def test_batch_records_checkin_under_the_captured_date_not_todays_date(client):

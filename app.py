@@ -112,6 +112,11 @@ VERIFICATION_TOLERANCE_DEGREES = 0.0005
 # owner's own list too, so it simply disappears. That cuts both ways: raising
 # this too far would slow the only lever for pulling a genuinely unsafe stop.
 # 5 roughly doubles the manual effort without blunting that lever.
+#
+# is_hidden now means EXACTLY ONE THING: removed by reports. Running out of
+# candy sets candy_available = False instead (see _apply_check_in), because
+# that state is reversible by the owner and this one is not. Do not reuse
+# is_hidden for any non-moderation condition without first giving it a way back.
 REPORT_HIDE_THRESHOLD = 5
 
 # Points economy. Households are anonymous, keyed only by an app-generated
@@ -709,14 +714,21 @@ def _apply_check_in(device_id, stop_id, latitude, longitude, check_in_date):
       "rejected"           -- invalid, with a machine-readable "reason"
                               and a human-readable "error". "reason" is
                               what lets a caller distinguish e.g.
-                              stop_unavailable (ran out/auto-hidden --
-                              the honest "this stop ran out before your
-                              check-in could sync" case) from
+                              stop_unavailable (hidden by reports) from
                               stop_not_found (never existed at all),
                               which the single real-time route doesn't
                               need to distinguish (both were always a
                               generic 404 there) but an offline batch
                               sync does.
+
+                              stop_unavailable NO LONGER covers "the
+                              house ran out". Running out sets
+                              candy_available = False and leaves the stop
+                              checkin-able, so a queued check-in that
+                              syncs after the candy is gone is now
+                              accepted rather than rejected. The only way
+                              to reach stop_unavailable is
+                              REPORT_HIDE_THRESHOLD reports.
 
     Only the "accepted" path ever mutates the database, and does so
     completely (CheckIn row + points + candy_count) before returning --
@@ -750,7 +762,22 @@ def _apply_check_in(device_id, stop_id, latitude, longitude, check_in_date):
     if stop.candy_count is not None:
         stop.candy_count = max(stop.candy_count - 1, 0)
         if stop.candy_count == 0:
-            stop.is_hidden = True
+            # Running out marks the stop NOT LIVE -- it does not hide it.
+            #
+            # is_hidden is a moderation state and is terminal: nothing anywhere
+            # sets it back to False, so hiding a stop for the ordinary, expected
+            # end of a successful night retired that household permanently,
+            # including next Halloween. candy_available is the state that
+            # already means "not handing out candy right now": it is reversible,
+            # the owner already controls it through PATCH /update-stop, and the
+            # map already renders it on its own axis (the live-glow halo).
+            #
+            # The stop deliberately stays in /nearby-stops and stays checkin-
+            # able. A kid who walks up should still get credit, and a check-in
+            # queued offline must not be rejected because the house ran out
+            # while it waited to sync -- candy_count floors at 0 above, so the
+            # extra check-ins are harmless.
+            stop.candy_available = False
 
     db.session.commit()
 

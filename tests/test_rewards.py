@@ -369,9 +369,12 @@ def test_check_in_decrements_candy_count(client):
     refreshed = db.session.get(Stop, stop.id)
     assert refreshed.candy_count == 1
     assert refreshed.is_hidden is False
+    assert refreshed.candy_available is True
 
 
-def test_check_in_hides_stop_when_candy_count_reaches_zero(client):
+def test_check_in_marks_stop_unavailable_when_candy_count_reaches_zero(client):
+    """Running out flips candy_available, NOT is_hidden. is_hidden is terminal
+    and means "removed by reports" only."""
     stop = _make_verified_stop(client)
     stop.candy_count = 1
     db.session.commit()
@@ -389,10 +392,110 @@ def test_check_in_hides_stop_when_candy_count_reaches_zero(client):
     assert response.status_code == 200
     refreshed = db.session.get(Stop, stop.id)
     assert refreshed.candy_count == 0
-    assert refreshed.is_hidden is True
+    assert refreshed.candy_available is False
+    assert refreshed.is_hidden is False
 
 
-def test_check_in_without_candy_count_never_hides_stop(client):
+def test_stop_that_ran_out_still_appears_in_nearby_stops(client):
+    """The whole point of not hiding: the household stays on the map, just
+    without the live glow."""
+    stop = _make_verified_stop(client)
+    stop.candy_count = 1
+    db.session.commit()
+
+    client.post(
+        "/check-in",
+        json={
+            "device_id": "checker-1",
+            "stop_id": stop.id,
+            "latitude": stop.latitude,
+            "longitude": stop.longitude,
+        },
+    )
+
+    nearby = client.get(f"/nearby-stops?lat={stop.latitude}&lon={stop.longitude}").get_json()
+    listed = [s for s in nearby if s["id"] == stop.id]
+    assert len(listed) == 1
+    assert listed[0]["candy_available"] is False
+    assert listed[0]["is_hidden"] is False
+
+
+def test_check_in_still_accepted_at_a_stop_that_already_ran_out(client):
+    """A kid who walks up to an empty house still gets credit."""
+    stop = _make_verified_stop(client)
+    stop.candy_count = 0
+    stop.candy_available = False
+    db.session.commit()
+
+    response = client.post(
+        "/check-in",
+        json={
+            "device_id": "late-arrival",
+            "stop_id": stop.id,
+            "latitude": stop.latitude,
+            "longitude": stop.longitude,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["points_awarded"] > 0
+
+    refreshed = db.session.get(Stop, stop.id)
+    assert refreshed.candy_count == 0  # floors, never goes negative
+    assert refreshed.is_hidden is False
+
+
+def test_owner_can_flip_candy_available_back_after_running_out(client):
+    """The recovery path that is_hidden never had -- PATCH /update-stop, which
+    already exists and is already ownership-gated."""
+    stop = _make_verified_stop(client)
+    stop.candy_count = 1
+    db.session.commit()
+
+    client.post(
+        "/check-in",
+        json={
+            "device_id": "checker-1",
+            "stop_id": stop.id,
+            "latitude": stop.latitude,
+            "longitude": stop.longitude,
+        },
+    )
+    assert db.session.get(Stop, stop.id).candy_available is False
+
+    response = client.patch(
+        f"/update-stop/{stop.id}",
+        json={"device_id": "registrant-1", "candy_available": True, "candy_count": 10},
+    )
+
+    assert response.status_code == 200
+    refreshed = db.session.get(Stop, stop.id)
+    assert refreshed.candy_available is True
+    assert refreshed.candy_count == 10
+
+
+def test_running_out_does_not_reject_a_stop_hidden_by_reports_differently(client):
+    """is_hidden still rejects check-ins. Running out must not have quietly
+    weakened the moderation guard."""
+    stop = _make_verified_stop(client)
+    stop.is_hidden = True
+    db.session.commit()
+
+    response = client.post(
+        "/check-in",
+        json={
+            "device_id": "checker-1",
+            "stop_id": stop.id,
+            "latitude": stop.latitude,
+            "longitude": stop.longitude,
+        },
+    )
+
+    assert response.status_code == 404
+
+
+def test_check_in_without_candy_count_never_changes_availability(client):
     stop = _make_verified_stop(client)
     assert stop.candy_count is None
 
@@ -410,6 +513,7 @@ def test_check_in_without_candy_count_never_hides_stop(client):
     refreshed = db.session.get(Stop, stop.id)
     assert refreshed.candy_count is None
     assert refreshed.is_hidden is False
+    assert refreshed.candy_available is True
 
 
 # ── Check-in milestone ───────────────────────────────────────────────────
