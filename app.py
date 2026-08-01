@@ -465,6 +465,38 @@ def _maybe_award_verification_bonus(stop):
     db.session.commit()
 
 
+@app.route("/version", methods=["GET"])
+def version():
+    """Which commit is actually running. Exists so a deploy can be confirmed in
+    one request.
+
+    Most releases change something observable (a route appears, a key
+    disappears) and can be verified by probing that. Some do not -- an ordering
+    fix, a threshold change, a query tweak -- and for those there was previously
+    no way to tell from outside whether a push had landed, short of the Render
+    dashboard.
+
+    RENDER_GIT_COMMIT is set automatically by Render on every deploy; it needs
+    no dashboard configuration and nothing in render.yaml (which is a stale
+    artifact here and does not drive this deployment anyway). It is absent when
+    running locally, which is not an error -- the route reports null rather than
+    500ing, so local and deployed behaviour differ only in the value.
+
+    Render's docs do not promise whether the value is a full 40-character SHA
+    or a short one, so callers should compare by prefix rather than equality.
+
+    PUBLIC AND UNAUTHENTICATED, DELIBERATELY, AND STRICTLY SHA-ONLY. This repo
+    is public, so the commit is already readable by anyone -- what this adds is
+    a precise "has that fix deployed yet?" oracle, which was judged acceptable
+    because auto-deploy-on-push already makes that inferable from the public
+    commit timestamps. That trade only holds while the response stays this
+    narrow. RENDER_INSTANCE_ID, RENDER_SERVICE_ID and RENDER_EXTERNAL_HOSTNAME
+    are all sitting in the same environment and none of them belong in a public
+    response, so do not "helpfully" widen this to the RENDER_* set.
+    """
+    return jsonify({"commit": os.environ.get("RENDER_GIT_COMMIT") or None})
+
+
 @app.route("/register-stop", methods=["POST"])
 def register_stop():
     data = request.get_json(silent=True) or {}
