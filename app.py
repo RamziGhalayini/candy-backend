@@ -1159,8 +1159,25 @@ def redeem_reward(reward_id):
 
 @app.route("/redemptions/<device_id>", methods=["GET"])
 def get_redemptions(device_id):
+    # id.desc() is a TIEBREAKER, not decoration. created_at alone is not a
+    # total order: it is set from datetime.now(timezone.utc) at insert, and two
+    # redemptions made in quick succession can carry the SAME timestamp -- the
+    # clock's resolution is not guaranteed finer than the gap between two
+    # requests. When timestamps tie, SQL is free to return the rows in any
+    # order, so "most recent first" silently became "whatever the engine felt
+    # like" for the exact case a user is most likely to see: two redemptions
+    # back to back, then immediately opening their history.
+    #
+    # id is monotonic per insert and unique, so it breaks every tie in true
+    # insertion order and matches what created_at is trying to express. It is
+    # a secondary key, so it does not change ordering when timestamps differ.
+    #
+    # This surfaced as an intermittently failing test, but the test was right:
+    # the API's ordering was genuinely unstable in production too.
     redemptions = (
-        Redemption.query.filter_by(device_id=device_id).order_by(Redemption.created_at.desc()).all()
+        Redemption.query.filter_by(device_id=device_id)
+        .order_by(Redemption.created_at.desc(), Redemption.id.desc())
+        .all()
     )
 
     result = []

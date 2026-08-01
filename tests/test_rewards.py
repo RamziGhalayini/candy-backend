@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime, timezone
 
 from app import REWARDS_CATALOG, TRIVIA_QUESTIONS, Household, Redemption, Stop, db
 
@@ -590,6 +590,89 @@ def test_get_redemptions_sorted_most_recent_first(client):
     assert len(body) == 2
     assert body[0]["reward_id"] == second_reward["id"]
     assert body[1]["reward_id"] == first_reward["id"]
+
+
+def test_get_redemptions_orders_by_id_when_created_at_ties(client):
+    """The deterministic version of the ordering guarantee above.
+
+    created_at is stamped from the clock at insert, so two redemptions made
+    back to back can carry the SAME timestamp -- which is exactly how the test
+    above used to fail intermittently. Rather than race the clock and hope,
+    this forces an exact tie and pins the tiebreaker: with equal timestamps the
+    newer row (higher id) must still come first.
+
+    Without the id.desc() secondary sort this assertion is not merely flaky,
+    it is undefined -- SQL may return tied rows in any order."""
+    household = Household(device_id="tie-device", points=1000)
+    db.session.add(household)
+    db.session.commit()
+
+    same_moment = datetime(2026, 10, 31, 20, 0, 0, tzinfo=timezone.utc)
+
+    older = Redemption(
+        device_id="tie-device",
+        reward_id="tie-older",
+        points_spent=10,
+        code="TIE-CODE-OLDER",
+        created_at=same_moment,
+    )
+    db.session.add(older)
+    db.session.commit()
+
+    newer = Redemption(
+        device_id="tie-device",
+        reward_id="tie-newer",
+        points_spent=10,
+        code="TIE-CODE-NEWER",
+        created_at=same_moment,
+    )
+    db.session.add(newer)
+    db.session.commit()
+
+    # Precondition: the rows really do tie on created_at, and id really is the
+    # only thing that distinguishes their insertion order.
+    assert older.created_at == newer.created_at
+    assert older.id < newer.id
+
+    body = client.get("/redemptions/tie-device").get_json()
+
+    assert [entry["reward_id"] for entry in body] == ["tie-newer", "tie-older"]
+
+
+def test_get_redemptions_still_sorts_by_created_at_when_timestamps_differ(client):
+    """The tiebreaker must not become the primary sort: an older row inserted
+    later (higher id) must still sort BELOW a newer row with an earlier id."""
+    household = Household(device_id="order-device", points=1000)
+    db.session.add(household)
+    db.session.commit()
+
+    # Inserted first (lower id) but timestamped LATER -- so correct output puts
+    # it first, which only holds if created_at still dominates id.
+    recent = Redemption(
+        device_id="order-device",
+        reward_id="order-recent",
+        points_spent=10,
+        code="ORDER-CODE-RECENT",
+        created_at=datetime(2026, 10, 31, 22, 0, 0, tzinfo=timezone.utc),
+    )
+    db.session.add(recent)
+    db.session.commit()
+
+    ancient = Redemption(
+        device_id="order-device",
+        reward_id="order-ancient",
+        points_spent=10,
+        code="ORDER-CODE-ANCIENT",
+        created_at=datetime(2026, 10, 31, 18, 0, 0, tzinfo=timezone.utc),
+    )
+    db.session.add(ancient)
+    db.session.commit()
+
+    assert recent.id < ancient.id
+
+    body = client.get("/redemptions/order-device").get_json()
+
+    assert [entry["reward_id"] for entry in body] == ["order-recent", "order-ancient"]
 
 
 def test_get_redemptions_only_returns_that_devices_history(client):
