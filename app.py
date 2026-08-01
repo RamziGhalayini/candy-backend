@@ -932,7 +932,18 @@ def night_ledger(device_id):
             "date": today.isoformat(),
             "total_checkins": len(checkins_today),
             "verified_stops_checked_in": sum(1 for stop in stops if stop.is_verified()),
-            "candy_available_count": sum(1 for stop in stops if stop.candy_available),
+            # candy_available_count was removed here. It counted stops whose
+            # candy_available was true AT READ TIME, which meant it duplicated
+            # total_checkins for as long as nothing set that flag automatically.
+            # Once running out started clearing the flag, the same read-time
+            # evaluation turned it actively wrong: a house visited at 6pm that
+            # ran out at 8pm dropped out of the child's recap, so the number
+            # fell as the night went on and could finish at zero.
+            #
+            # Answering "did I get candy here" honestly needs the value AS OF
+            # the visit, which CheckIn does not store (device_id, stop_id,
+            # check_in_date only). That is a schema change for a tile that has
+            # never shown a distinct number, so the stat is gone instead.
             "greetings_encountered": greetings_encountered,
             "greetings_heard": greetings_heard,
             "greetings_unlocked": greetings_unlocked,

@@ -51,14 +51,13 @@ def test_night_ledger_no_checkins_returns_zeros(client):
         "date": date.today().isoformat(),
         "total_checkins": 0,
         "verified_stops_checked_in": 0,
-        "candy_available_count": 0,
         "greetings_encountered": 0,
         "greetings_heard": 0,
         "greetings_unlocked": False,
     }
 
 
-def test_night_ledger_counts_todays_checkins_and_candy(client):
+def test_night_ledger_counts_todays_checkins(client):
     stop_a = _make_verified_stop(client, device_id="reg-a", lat=42.0, lon=-71.0, name="House A")
     stop_b = _make_verified_stop(client, device_id="reg-b", lat=43.0, lon=-71.0, name="House B")
     stop_b.candy_available = False
@@ -73,7 +72,21 @@ def test_night_ledger_counts_todays_checkins_and_candy(client):
     body = response.get_json()
     assert body["total_checkins"] == 2
     assert body["verified_stops_checked_in"] == 2
-    assert body["candy_available_count"] == 1
+
+
+def test_night_ledger_does_not_report_candy_available_count(client):
+    """The stat is gone. A stop that has run out must not change the recap --
+    a child's ledger should never shrink because a house emptied later."""
+    stop = _make_verified_stop(client, device_id="reg-a", lat=42.0, lon=-71.0, name="House A")
+    _check_in(client, "walker-1", stop)
+
+    stop.candy_available = False
+    db.session.commit()
+
+    body = client.get("/night-ledger/walker-1").get_json()
+
+    assert "candy_available_count" not in body
+    assert body["total_checkins"] == 1
 
 
 def test_night_ledger_locked_household_shows_zero_heard(client):
