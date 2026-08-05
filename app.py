@@ -25,7 +25,6 @@ from typing import List
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 from flask import Flask, jsonify, request
-from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from pydantic import BaseModel as PydanticBaseModel, Field, ValidationError, field_validator
 from sqlalchemy import inspect, text
@@ -39,7 +38,17 @@ from apple_verification import AppleVerificationConfigError, AppleVerificationEr
 LEGEND_MODE_PRODUCT_ID = "com.treatmapapp.candystops.legendmode"
 
 app = Flask(__name__)
-CORS(app)
+
+# No CORS layer. This API has exactly one client -- the candy-app iOS/Android
+# build -- and a native fetch() sends no Origin header and does not enforce
+# CORS, so nothing legitimate here needs an Access-Control-Allow-Origin
+# header. The previous `CORS(app)` sent one for every origin, which only ever
+# helped page JavaScript we don't have: there is no web build in service (the
+# Expo `dist/` export is dead) and no site on treatmapapp/treatmap domains.
+#
+# If a real web front end ever ships, re-add Flask-Cors (still pinned in
+# requirements.txt) scoped to that one origin -- CORS(app, origins=[...]) --
+# rather than restoring the unrestricted call.
 
 database_url = os.environ.get("DATABASE_URL")
 if database_url:
