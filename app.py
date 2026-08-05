@@ -127,6 +127,23 @@ TRIVIA_POINTS = 10
 CHECKIN_RADIUS_METERS = 75
 CHECKIN_MILESTONE_INTERVAL = 20
 
+# Bounds on a single /nearby-stops or /nearby-businesses query.
+#
+# The client's largest legitimate search is the "giving" mode's 10-mile
+# preset (candy-app's RADIUS_PRESETS_BY_MODE in nearby-stops.tsx), which is
+# 16.09 km; 25 leaves headroom for that and for any preset added later
+# without a matching backend change. Both routes measure, sort and
+# serialise every row inside the radius on one worker, so the radius is
+# really a request for server work -- it needs a ceiling that isn't the
+# size of the table.
+#
+# MAX_NEARBY_RESULTS bounds the response independently of distance: a
+# perfectly legal radius over a dense neighbourhood can still match more
+# rows than a map can draw. Nearest-first is kept, which is what both the
+# map and the list actually render.
+MAX_RADIUS_KM = 25.0
+MAX_NEARBY_RESULTS = 200
+
 # Business rewards are business-set (Business.points_cost, entered at
 # registration) so an owner can price their own offer; this is the fallback
 # for businesses that leave it blank, roughly matched to the existing
@@ -168,7 +185,23 @@ class Stop(db.Model):
         ).count()
         return matches >= 2
 
-    def to_dict(self):
+    def to_dict(self, verified=None):
+        """`verified` lets a caller that has already computed this stop's
+        verification state pass it in, instead of paying for is_verified()'s
+        own COUNT query per stop -- see _verified_stop_ids, which computes it
+        for a whole list at once. Omitted, the value is computed here exactly
+        as before, so every single-stop caller is unaffected.
+
+        report_count is deliberately not in this payload. Nothing reads it:
+        candy-app declares it in types/stop.ts and app/my-stops.tsx and never
+        renders it, and no test asserts on it from a response body. It is
+        internal moderation bookkeeping, and this dict is what the
+        unauthenticated /nearby-stops hands to any caller. is_hidden STAYS --
+        candy-app filters on it at index.tsx (the owner's own list, which the
+        server does not filter) and nearby-stops.tsx, so dropping it would
+        change behaviour in already-installed clients that this repo cannot
+        redeploy.
+        """
         return {
             "id": self.id,
             "name": self.name,
@@ -176,9 +209,8 @@ class Stop(db.Model):
             "latitude": self.latitude,
             "longitude": self.longitude,
             "candy_available": self.candy_available,
-            "report_count": self.report_count,
             "is_hidden": self.is_hidden,
-            "verified": self.is_verified(),
+            "verified": self.is_verified() if verified is None else verified,
             "candy_count": self.candy_count,
             "greeting_audio_url": self.greeting_audio_url,
         }
@@ -420,6 +452,93 @@ def haversine_distance_km(lat1, lon1, lat2, lon2):
     return earth_radius_km * c
 
 
+# One degree of latitude is this many km everywhere. Longitude is not: a
+# degree of it shrinks towards the poles, which _bounding_box accounts for.
+_KM_PER_DEGREE_LAT = 111.32
+
+
+def _bounding_box(lat, lon, radius_km, margin_degrees=0.0):
+    """A lat/lon rectangle that fully CONTAINS every point within radius_km
+    of (lat, lon), widened by margin_degrees on all sides.
+
+    Purpose is to turn "measure every row in the table" into an indexable
+    WHERE clause. It is a prefilter and deliberately a superset -- it selects
+    a square around a circle, so the haversine check afterwards is still the
+    authority on what's actually in range.
+
+    Returns None when a simple rectangle cannot bound the region: within
+    radius_km of a pole, or where the longitude span would wrap past the
+    antimeridian. A None result means "no safe prefilter", and callers fall
+    back to scanning every row -- slower, but never wrong. That cannot happen
+    at any radius this API accepts (MAX_RADIUS_KM) outside the far Arctic.
+    """
+    lat_delta = radius_km / _KM_PER_DEGREE_LAT + margin_degrees
+    min_lat = lat - lat_delta
+    max_lat = lat + lat_delta
+    if min_lat <= -90.0 or max_lat >= 90.0:
+        return None
+
+    # Widest longitude span in the band is at whichever edge sits closest to
+    # a pole, since that is where a degree of longitude is shortest and so
+    # the most degrees are needed to cover radius_km.
+    cos_widest = math.cos(math.radians(max(abs(min_lat), abs(max_lat))))
+    if cos_widest <= 1e-9:
+        return None
+    lon_delta = radius_km / (_KM_PER_DEGREE_LAT * cos_widest) + margin_degrees
+    min_lon = lon - lon_delta
+    max_lon = lon + lon_delta
+    if min_lon < -180.0 or max_lon > 180.0:
+        return None
+
+    return min_lat, max_lat, min_lon, max_lon
+
+
+def _verified_stop_ids(candidates, universe):
+    """Stop.is_verified() for many stops at once, as a set of verified ids.
+
+    is_verified() runs its own COUNT per stop, so rendering a list of N stops
+    cost N+1 queries. This answers it for every candidate in a single pass
+    over `universe`, with identical semantics: a stop is verified once at
+    least 2 stops (itself included) sit within VERIFICATION_TOLERANCE_DEGREES
+    of it on BOTH axes, hidden ones counting the same as visible ones --
+    is_verified() has never filtered on is_hidden and this must not either.
+
+    `universe` MUST contain every stop that could sit within the tolerance of
+    any candidate, which is why callers widen their query by that tolerance
+    before fetching: a candidate at the very edge of a search radius can be
+    verified by a neighbour just outside it, and leaving that neighbour out
+    would report a genuinely verified stop as unverified.
+
+    Buckets stops into tolerance-sized cells so each candidate only compares
+    against the 3x3 block of cells its own tolerance window can reach -- the
+    window is 2 tolerances wide, so it spans at most 3 cells per axis. That
+    block is a superset; the explicit comparison below is what decides.
+    """
+    cell = VERIFICATION_TOLERANCE_DEGREES
+    buckets = {}
+    for stop in universe:
+        key = (math.floor(stop.latitude / cell), math.floor(stop.longitude / cell))
+        buckets.setdefault(key, []).append(stop)
+
+    verified = set()
+    for stop in candidates:
+        lat_cell = math.floor(stop.latitude / cell)
+        lon_cell = math.floor(stop.longitude / cell)
+        matches = 0
+        for lat_offset in (-1, 0, 1):
+            for lon_offset in (-1, 0, 1):
+                for other in buckets.get((lat_cell + lat_offset, lon_cell + lon_offset), ()):
+                    if (
+                        abs(other.latitude - stop.latitude) <= cell
+                        and abs(other.longitude - stop.longitude) <= cell
+                    ):
+                        matches += 1
+        if matches >= 2:
+            verified.add(stop.id)
+
+    return verified
+
+
 def _get_or_create_household(device_id):
     household = Household.query.filter_by(device_id=device_id).first()
     if household is None:
@@ -538,52 +657,118 @@ def register_stop():
     return jsonify(stop.to_dict()), 201
 
 
-class _InvalidRadius(ValueError):
-    pass
+class _InvalidSearchArgs(ValueError):
+    """Carries the client-facing message for a bad lat/lon/radius."""
 
 
 def _parse_radius_km(args):
     """Flask's request.args.get(..., type=float) silently falls back to the
     default on a parse failure instead of erroring -- a malformed radius
     (empty string, a comma, etc.) would otherwise quietly search 1km instead
-    of what the caller asked for. Parse it explicitly so bad input 400s."""
+    of what the caller asked for. Parse it explicitly so bad input 400s.
+
+    Bounded by MAX_RADIUS_KM (see its comment): the radius decides how many
+    rows both search routes measure and sort, so it is an input that has to
+    have a ceiling.
+
+    float() also accepts "inf" and "nan", and neither behaves like a number
+    here -- "inf" compares greater than every distance and "nan" compares
+    less than none, so they read as "everything" and "nothing" rather than as
+    the bad input they are. isfinite rejects both by name.
+    """
     raw = args.get("radius")
     if raw is None:
         return 1.0
     try:
-        return float(raw)
+        radius = float(raw)
     except ValueError:
-        raise _InvalidRadius(raw)
+        raise _InvalidSearchArgs("radius must be a number")
+    if not math.isfinite(radius):
+        raise _InvalidSearchArgs("radius must be a number")
+    if radius <= 0:
+        raise _InvalidSearchArgs("radius must be greater than 0")
+    if radius > MAX_RADIUS_KM:
+        raise _InvalidSearchArgs(f"radius must be {MAX_RADIUS_KM:g} km or less")
+    return radius
+
+
+def _parse_search_origin(args):
+    """The (lat, lon) both search routes measure from. Messages below are
+    unchanged from when each route inlined this.
+
+    The finite/range checks are new. math.sin() raises on infinity, so a lat
+    of "inf" reached haversine_distance_km and came back a 500 rather than
+    the 400 it is; "nan" silently matched nothing at all.
+    """
+    raw_lat = args.get("lat")
+    raw_lon = args.get("lon")
+    if raw_lat is None or raw_lon is None:
+        raise _InvalidSearchArgs("lat and lon query params are required")
+    try:
+        lat = float(raw_lat)
+        lon = float(raw_lon)
+    except ValueError:
+        raise _InvalidSearchArgs("lat and lon must be numbers")
+    if not math.isfinite(lat) or not math.isfinite(lon):
+        raise _InvalidSearchArgs("lat and lon must be numbers")
+    if not -90.0 <= lat <= 90.0 or not -180.0 <= lon <= 180.0:
+        raise _InvalidSearchArgs("lat must be between -90 and 90, lon between -180 and 180")
+    return lat, lon
 
 
 @app.route("/nearby-stops", methods=["GET"])
 def nearby_stops():
-    lat = request.args.get("lat")
-    lon = request.args.get("lon")
-
-    if lat is None or lon is None:
-        return jsonify({"error": "lat and lon query params are required"}), 400
-
     try:
-        lat = float(lat)
-        lon = float(lon)
-    except ValueError:
-        return jsonify({"error": "lat and lon must be numbers"}), 400
-
-    try:
+        lat, lon = _parse_search_origin(request.args)
         radius = _parse_radius_km(request.args)
-    except _InvalidRadius:
-        return jsonify({"error": "radius must be a number"}), 400
+    except _InvalidSearchArgs as error:
+        return jsonify({"error": str(error)}), 400
 
-    nearby = []
-    for stop in Stop.query.filter_by(is_hidden=False).all():
+    # Fetch a superset of what can be returned, in one query, rather than
+    # every row in the table. Widened by VERIFICATION_TOLERANCE_DEGREES
+    # because this set is also what decides each result's `verified` flag,
+    # and a stop at the edge of the radius can be verified by a neighbour
+    # just outside it (see _verified_stop_ids).
+    #
+    # Hidden stops are NOT excluded here: they still count towards a
+    # neighbour's verification, exactly as they always have. They are
+    # skipped below, at the point of building the response.
+    query = Stop.query
+    box = _bounding_box(lat, lon, radius, VERIFICATION_TOLERANCE_DEGREES)
+    if box is not None:
+        min_lat, max_lat, min_lon, max_lon = box
+        query = query.filter(
+            Stop.latitude.between(min_lat, max_lat),
+            Stop.longitude.between(min_lon, max_lon),
+        )
+    universe = query.all()
+
+    in_range = []
+    for stop in universe:
+        if stop.is_hidden:
+            continue
         distance = haversine_distance_km(lat, lon, stop.latitude, stop.longitude)
         if distance <= radius:
-            nearby.append({**stop.to_dict(), "distance_km": round(distance, 3)})
+            in_range.append((distance, stop))
 
-    nearby.sort(key=lambda s: s["distance_km"])
+    # id breaks distance ties, for the same reason /redemptions orders by id
+    # after created_at: two stops at the same distance would otherwise come
+    # back in whatever order the engine felt like, and the order a child sees
+    # would shift between two identical searches.
+    in_range.sort(key=lambda pair: (pair[0], pair[1].id))
+    in_range = in_range[:MAX_NEARBY_RESULTS]
 
-    return jsonify(nearby)
+    verified_ids = _verified_stop_ids([stop for _, stop in in_range], universe)
+
+    return jsonify(
+        [
+            {
+                **stop.to_dict(verified=stop.id in verified_ids),
+                "distance_km": round(distance, 3),
+            }
+            for distance, stop in in_range
+        ]
+    )
 
 
 @app.route("/report-stop/<int:stop_id>", methods=["POST"])
@@ -1042,32 +1227,38 @@ def register_business():
 
 @app.route("/nearby-businesses", methods=["GET"])
 def nearby_businesses():
-    lat = request.args.get("lat")
-    lon = request.args.get("lon")
-
-    if lat is None or lon is None:
-        return jsonify({"error": "lat and lon query params are required"}), 400
-
     try:
-        lat = float(lat)
-        lon = float(lon)
-    except ValueError:
-        return jsonify({"error": "lat and lon must be numbers"}), 400
-
-    try:
+        lat, lon = _parse_search_origin(request.args)
         radius = _parse_radius_km(request.args)
-    except _InvalidRadius:
-        return jsonify({"error": "radius must be a number"}), 400
+    except _InvalidSearchArgs as error:
+        return jsonify({"error": str(error)}), 400
 
-    nearby = []
-    for business in Business.query.all():
+    # Same prefilter as /nearby-stops, without the verification margin --
+    # businesses have no verification, so nothing here needs neighbours.
+    query = Business.query
+    box = _bounding_box(lat, lon, radius)
+    if box is not None:
+        min_lat, max_lat, min_lon, max_lon = box
+        query = query.filter(
+            Business.latitude.between(min_lat, max_lat),
+            Business.longitude.between(min_lon, max_lon),
+        )
+
+    in_range = []
+    for business in query.all():
         distance = haversine_distance_km(lat, lon, business.latitude, business.longitude)
         if distance <= radius:
-            nearby.append({**business.to_dict(), "distance_km": round(distance, 3)})
+            in_range.append((distance, business))
 
-    nearby.sort(key=lambda b: b["distance_km"])
+    in_range.sort(key=lambda pair: (pair[0], pair[1].id))
+    in_range = in_range[:MAX_NEARBY_RESULTS]
 
-    return jsonify(nearby)
+    return jsonify(
+        [
+            {**business.to_dict(), "distance_km": round(distance, 3)}
+            for distance, business in in_range
+        ]
+    )
 
 
 @app.route("/trivia/today", methods=["GET"])
