@@ -343,6 +343,7 @@ def test_register_stop_rejects_negative_candy_count(client):
             "latitude": 42.0,
             "longitude": -71.0,
             "candy_count": -1,
+            "device_id": "test-registrant",
         },
     )
 

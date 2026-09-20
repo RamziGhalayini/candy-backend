@@ -63,3 +63,45 @@ def test_registrant_still_gets_their_own_contact_email_back(client):
     assert response.get_json()["contact_email"] == "owner@sugarplum.test"
 
 
+# --------------------------------------------------------------------------
+# 2. /register-stop requires an owner
+# --------------------------------------------------------------------------
+
+def test_register_stop_rejects_missing_device_id(client):
+    response = client.post(
+        "/register-stop",
+        json={"name": "No Owner", "type": "house", "latitude": 28.75, "longitude": -81.33},
+    )
+    assert response.status_code == 400
+    assert "device_id" in response.get_json()["error"]
+
+
+def test_register_stop_rejects_blank_device_id(client):
+    response = client.post(
+        "/register-stop",
+        json={
+            "name": "No Owner",
+            "type": "house",
+            "latitude": 28.75,
+            "longitude": -81.33,
+            "device_id": "   ",
+        },
+    )
+    assert response.status_code == 400
+
+
+def test_register_stop_still_works_with_a_device_id(client):
+    response = _register(client)
+    assert response.status_code == 201
+    assert response.get_json()["name"] == "Test House"
+
+
+def test_registered_stop_always_has_an_owner(client):
+    """The point of the requirement: no route can now produce a stop that
+    nobody can ever edit, correct, or attach a greeting to."""
+    stop_id = _register(client, device_id="  dev-with-space  ").get_json()["id"]
+    with app_module.app.app_context():
+        stop = app_module.db.session.get(app_module.Stop, stop_id)
+        assert stop.registrant_device_id == "dev-with-space"
+
+

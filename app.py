@@ -652,6 +652,21 @@ def register_stop():
     if name is None or stop_type is None or latitude is None or longitude is None:
         return jsonify({"error": "name, type, latitude, and longitude are required"}), 400
 
+    # device_id is REQUIRED here. It used to be optional, which meant a stop
+    # could be created with registrant_device_id = None -- an ownerless
+    # listing. That is not a cosmetic gap: every ownership check in this file
+    # compares the caller's id against that column, and None equals nothing,
+    # so an ownerless stop can never be edited, corrected, or have a greeting
+    # attached by anyone, ever. It can only be reported until it disappears.
+    #
+    # This collects NOTHING new. candy-app already sends device_id on this
+    # route unconditionally (register.tsx calls getDeviceId() and includes it
+    # in the body), so no real user is affected. What it refuses is requests
+    # that did not come from the app.
+    if not isinstance(device_id, str) or not device_id.strip():
+        return jsonify({"error": "device_id is required"}), 400
+    device_id = device_id.strip()
+
     try:
         latitude = float(latitude)
         longitude = float(longitude)

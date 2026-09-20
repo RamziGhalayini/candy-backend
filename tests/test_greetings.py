@@ -204,9 +204,28 @@ def test_upload_greeting_requires_a_device_id(client, monkeypatch):
 
 
 def test_upload_greeting_rejected_for_a_stop_with_no_registrant(client, monkeypatch):
-    """A stop registered without a device_id has no owner to check against.
-    Fail closed rather than letting anyone claim it."""
-    stop_id = _register_stop(client, device_id=None)
+    """A stop with no owner recorded has nothing to check a caller against.
+    Fail closed rather than letting anyone claim it.
+
+    The row is inserted directly rather than through /register-stop, because
+    that route now requires a device_id and will not create an ownerless stop.
+    This scenario has NOT gone away: rows created before that requirement are
+    still in production with registrant_device_id = NULL, and this asserts the
+    gate still holds for them.
+    """
+    with app_module.app.app_context():
+        legacy = Stop(
+            name="Legacy Ownerless House",
+            type="house",
+            latitude=42.0,
+            longitude=-71.0,
+            candy_available=True,
+            registrant_device_id=None,
+        )
+        db.session.add(legacy)
+        db.session.commit()
+        stop_id = legacy.id
+
     monkeypatch.setattr(app_module, "r2_client", MagicMock())
 
     response = client.post(
