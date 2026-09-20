@@ -5,10 +5,20 @@ pass. They are the reason to believe the fixes do what the commit says.
 """
 
 import io
+import uuid
 
 import pytest
 
 import app as app_module
+
+
+@pytest.fixture(autouse=True)
+def _clear_rate_buckets():
+    """The limiter is process-global, so one test's calls would otherwise
+    count against the next one's budget."""
+    app_module._RATE_BUCKETS.clear()
+    yield
+    app_module._RATE_BUCKETS.clear()
 
 
 def _register(client, device_id="dev-owner", lat=28.75, lon=-81.33, name="Test House"):
@@ -181,3 +191,75 @@ def test_looks_like_audio_signatures():
         assert not app_module._looks_like_audio(payload), payload[:8]
 
 
+# --------------------------------------------------------------------------
+# 4. per-IP rate limiting
+# --------------------------------------------------------------------------
+
+def test_report_stop_is_rate_limited_per_ip(client):
+    stop_id = _register(client).get_json()["id"]
+
+    max_calls, _window = app_module._RATE_LIMITS["report_stop"]
+    headers = {"X-Forwarded-For": "203.0.113.10"}
+
+    for _ in range(max_calls):
+        client.post(f"/report-stop/{stop_id}", json={"reason": "x"}, headers=headers)
+
+    blocked = client.post(f"/report-stop/{stop_id}", json={"reason": "x"}, headers=headers)
+    assert blocked.status_code == 429
+    assert blocked.headers.get("Retry-After")
+
+
+def test_rate_limit_is_scoped_to_the_caller_not_global(client):
+    """A second address must not inherit the first one's exhausted budget."""
+    stop_id = _register(client).get_json()["id"]
+    max_calls, _window = app_module._RATE_LIMITS["report_stop"]
+
+    for _ in range(max_calls):
+        client.post(
+            f"/report-stop/{stop_id}",
+            json={"reason": "x"},
+            headers={"X-Forwarded-For": "203.0.113.10"},
+        )
+
+    other = client.post(
+        f"/report-stop/{stop_id}",
+        json={"reason": "x"},
+        headers={"X-Forwarded-For": "198.51.100.77"},
+    )
+    assert other.status_code != 429
+
+
+def test_rate_limit_is_scoped_per_endpoint(client):
+    """Exhausting one route must not lock a caller out of an unrelated one."""
+    max_calls, _window = app_module._RATE_LIMITS["register_stop"]
+    headers = {"X-Forwarded-For": "203.0.113.20"}
+
+    for i in range(max_calls):
+        client.post(
+            "/register-stop",
+            json={
+                "name": f"H{i}",
+                "type": "house",
+                "latitude": 28.75,
+                "longitude": -81.33,
+                "device_id": f"dev-{uuid.uuid4().hex}",
+            },
+            headers=headers,
+        )
+
+    assert client.get("/nearby-stops?lat=28.75&lon=-81.33&radius=1", headers=headers).status_code == 200
+
+
+def test_unlisted_endpoints_are_not_limited(client):
+    headers = {"X-Forwarded-For": "203.0.113.30"}
+    for _ in range(50):
+        assert client.get("/version", headers=headers).status_code == 200
+
+
+def test_limiter_fails_open_if_it_raises(client, monkeypatch):
+    """A bug in the limiter must never take the app down."""
+    def _boom():
+        raise RuntimeError("limiter exploded")
+
+    monkeypatch.setattr(app_module, "_client_ip", _boom)
+    assert client.get("/nearby-stops?lat=28.75&lon=-81.33&radius=1").status_code == 200

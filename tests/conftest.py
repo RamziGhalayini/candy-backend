@@ -41,6 +41,18 @@ from app import _run_lightweight_migrations, app as flask_app, db  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
+def _reset_rate_limiter():
+    """The per-IP limiter's counters are process-global, so without this one
+    test's requests spend the next test's budget and the failure shows up as
+    an unrelated KeyError several files later. Reset between tests."""
+    from app import _RATE_BUCKETS
+
+    _RATE_BUCKETS.clear()
+    yield
+    _RATE_BUCKETS.clear()
+
+
+@pytest.fixture(autouse=True)
 def db_session():
     """Reset the schema before every test so each test starts from a clean,
     isolated slate within the copied database file."""

@@ -18,7 +18,10 @@ import json
 import math
 import os
 import secrets
+import threading
+import time
 import uuid
+from collections import deque
 from datetime import date, datetime, timezone
 from typing import List
 
@@ -604,6 +607,123 @@ def _maybe_award_verification_bonus(stop):
     if original.registrant_device_id:
         _award_points(original.registrant_device_id, VERIFICATION_BONUS_POINTS)
     db.session.commit()
+
+
+# ---------------------------------------------------------------------------
+# Per-IP rate limiting
+#
+# WHAT THIS IS NOT: a defence against a determined attacker. Cloud IPs cost
+# pennies, so anyone willing to rotate them walks straight through it. It is a
+# cost multiplier on casual and scripted abuse, and it is the difference
+# between "five curl calls hide a family's house" and "you have to work at it".
+#
+# Deliberately hand-rolled rather than Flask-Limiter:
+#   - no new dependency, no Redis, no bill
+#   - in-memory counters are COHERENT HERE only because the service runs a
+#     single gunicorn worker (WEB_CONCURRENCY is unset). If a second worker is
+#     ever added, each one keeps its own counters and the effective limit
+#     multiplies. That is a real caveat, not a theoretical one.
+#   - counters reset on deploy and on free-tier spin-down. Accepted.
+#
+# Keyed on X-Forwarded-For's leftmost entry, which is what Render/Cloudflare
+# put the client IP in. A caller can spoof that header, which is another reason
+# this is a speed bump rather than a control.
+#
+# NOT keyed on device_id, on purpose. Per-device limiting was considered and
+# rejected twice (2026-07-28, 2026-08-01) because it requires retaining a dated
+# per-device association, and device_id is a client-chosen string that an
+# attacker regenerates for free anyway. It would cost real privacy and buy
+# nothing.
+# ---------------------------------------------------------------------------
+# 🚨 THE CONSTRAINT THAT SETS EVERY NUMBER BELOW: CARRIER NAT.
+#
+# This is a mobile app used outdoors, at night, on cellular. Mobile carriers
+# put very large numbers of subscribers behind a single public address, and a
+# household on shared wifi is one address for the whole family. So "one IP"
+# here does not mean "one person" -- on Halloween night it can mean an entire
+# neighbourhood.
+#
+# That inverts the usual trade-off. A limit tuned to stop abuse will lock out
+# real families on the one night the product exists for, and they will have no
+# idea why. A false positive here is worse than the abuse it prevents.
+#
+# So the limits are split by what a legitimate shared address plausibly does:
+#
+#   - Routes where normal volume is LOW and damage is HIGH (registering a
+#     stop, reporting one, uploading audio, registering a business) get real
+#     limits. Even a whole street does not register thirty houses an hour.
+#
+#   - Routes on the normal-use path (searching, checking in, trivia) get
+#     limits high enough that no plausible NAT pool reaches them, which means
+#     they only stop a single-source flood taking down the one worker. They
+#     were never going to stop a determined harvester anyway -- the radius cap
+#     comment explains why that fight is not winnable server-side.
+#
+# If a limit ever has to be lowered, lower the first group, never the second.
+# ---------------------------------------------------------------------------
+_RATE_LIMITS = {
+    # Low legitimate volume, high damage. Still set well above any plausible
+    # shared-address burst -- a neighbourhood association signing houses up at
+    # a Halloween kickoff, on one wifi, is a real scenario and must not 429.
+    # register_stop at 300/hr still caps a mass-insert script hard.
+    "register_stop": (300, 3600),
+    "report_stop": (60, 3600),
+    "upload_greeting": (60, 3600),
+    "register_business": (30, 3600),
+    "mint_legend_code": (20, 3600),
+    "redeem_legend_code": (20, 3600),
+    # normal-use path -- flood protection only, deliberately far above
+    # anything a real shared address produces
+    "nearby_stops": (2000, 3600),
+    "nearby_businesses": (2000, 3600),
+    "check_in": (2000, 3600),
+    "check_in_batch": (600, 3600),
+    "redeem_reward": (600, 3600),
+    "trivia_answer": (600, 3600),
+}
+
+_RATE_BUCKETS = {}
+_RATE_LOCK = threading.Lock()
+_RATE_MAX_KEYS = 20000
+
+
+def _client_ip():
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.remote_addr or "unknown"
+
+
+@app.before_request
+def _enforce_rate_limit():
+    """Reject a caller that has exceeded an endpoint's hourly allowance.
+
+    Fails OPEN on any internal error: a bug in the limiter must never be able
+    to take the app down on the one night it matters.
+    """
+    try:
+        limit = _RATE_LIMITS.get(request.endpoint)
+        if limit is None:
+            return None
+        max_calls, window = limit
+        key = (request.endpoint, _client_ip())
+        now = time.monotonic()
+        with _RATE_LOCK:
+            if len(_RATE_BUCKETS) > _RATE_MAX_KEYS:
+                _RATE_BUCKETS.clear()
+            hits = _RATE_BUCKETS.setdefault(key, deque())
+            while hits and now - hits[0] > window:
+                hits.popleft()
+            if len(hits) >= max_calls:
+                retry_after = int(window - (now - hits[0])) + 1
+                response = jsonify({"error": "too many requests, please try again later"})
+                response.status_code = 429
+                response.headers["Retry-After"] = str(max(retry_after, 1))
+                return response
+            hits.append(now)
+    except Exception:
+        return None
+    return None
 
 
 @app.route("/version", methods=["GET"])
