@@ -22,7 +22,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import List
 
 import boto3
@@ -155,6 +155,32 @@ CHECKIN_MILESTONE_INTERVAL = 20
 # map and the list actually render.
 MAX_RADIUS_KM = 25.0
 MAX_NEARBY_RESULTS = 200
+
+# ---------------------------------------------------------------------------
+# CheckIn retention
+#
+# A CheckIn row records that a particular device was within CHECKIN_RADIUS_
+# METERS of a particular home on a particular date. That is the most sensitive
+# thing this service stores, and until now NOTHING in the entire application
+# ever deleted a row of any kind -- no route, no purge, no expiry. Every row
+# ever written was still there.
+#
+# This is the mechanism. The NUMBER is a policy decision, not an engineering
+# one, and it is deliberately set conservatively:
+#
+#   400 days  (current) keeps a full year, so nothing about streaks, levels or
+#             the check-in milestone changes for anyone. Growth is bounded and
+#             rows stop accumulating forever, but little is actually discarded.
+#
+#    45 days  would cover the Halloween season and discard the rest. That is
+#             the privacy-maximising choice, and the one worth asking counsel
+#             about -- but it makes the lifetime check-in count reset between
+#             seasons, which resets milestones. That is a PRODUCT change and
+#             is Ramzi's call, not one to make quietly.
+#
+# Whichever number is chosen, Night Ledger is unaffected: it only ever queries
+# the current day.
+CHECKIN_RETENTION_DAYS = 400
 
 # Business rewards are business-set (Business.points_cost, entered at
 # registration) so an owner can price their own offer; this is the fallback
@@ -1103,6 +1129,38 @@ def update_stop(stop_id):
     return jsonify(stop.to_dict())
 
 
+def _purge_expired_check_ins():
+    """Drop CheckIn rows older than CHECKIN_RETENTION_DAYS.
+
+    Runs opportunistically on the write path rather than on a schedule: this
+    service has no scheduler, no worker and no cron, and adding one for this
+    would be a new moving part on a free-tier box. Piggy-backing on check-in
+    writes means the purge happens exactly when the table is growing, and not
+    at all when nobody is using the app.
+
+    Caller is responsible for the commit -- this only stages the delete, so it
+    joins the same transaction as the check-in that triggered it rather than
+    opening a second one.
+
+    Never raises. A failure here must not cost a child their check-in.
+    """
+    try:
+        cutoff = date.today() - timedelta(days=CHECKIN_RETENTION_DAYS)
+        CheckIn.query.filter(CheckIn.check_in_date < cutoff).delete(synchronize_session=False)
+    except Exception:
+        # Deliberately NOT db.session.rollback(). This runs inside the
+        # CALLER'S transaction, after the CheckIn row, the points award and
+        # the candy_count decrement have already been staged. Rolling back
+        # here discards all of that: the caller's commit then persists
+        # nothing while the route still returns "accepted" with points, and
+        # the follow-up count reads 0, firing a bogus milestone as well.
+        #
+        # A DELETE that failed has staged nothing of its own to undo, so the
+        # correct response is to leave the transaction untouched and let the
+        # check-in commit. Retention simply retries on the next write.
+        pass
+
+
 def _apply_check_in(device_id, stop_id, latitude, longitude, check_in_date):
     """Shared validation + side-effect logic for BOTH POST /check-in (real
     time) and POST /check-in/batch (offline-first sync) -- the two must
@@ -1189,6 +1247,8 @@ def _apply_check_in(device_id, stop_id, latitude, longitude, check_in_date):
             # while it waited to sync -- candy_count floors at 0 above, so the
             # extra check-ins are harmless.
             stop.candy_available = False
+
+    _purge_expired_check_ins()
 
     db.session.commit()
 
