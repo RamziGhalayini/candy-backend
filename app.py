@@ -333,8 +333,19 @@ class Business(db.Model):
     def resolved_points_cost(self):
         return self.points_cost if self.points_cost is not None else BUSINESS_REWARD_DEFAULT_POINTS_COST
 
-    def to_dict(self):
-        return {
+    def to_dict(self, include_contact=False):
+        """contact_email is NOT in the default payload.
+
+        /nearby-businesses is unauthenticated and unbounded in the same way
+        /nearby-stops is, so including the address here meant one request
+        returned every registered business's real email. Nothing in candy-app
+        renders it. The registrant gets it back on their own POST (where they
+        just typed it), and nowhere else.
+
+        Mirrors Stop.to_dict(verified=...): callers that need more opt in,
+        the default is the narrow payload.
+        """
+        payload = {
             "id": self.id,
             "name": self.name,
             "address": self.address,
@@ -342,11 +353,13 @@ class Business(db.Model):
             "longitude": self.longitude,
             "category": self.category,
             "description": self.description,
-            "contact_email": self.contact_email,
             "reward_offer": self.reward_offer,
             "points_cost": self.resolved_points_cost(),
             "created_at": self.created_at.isoformat(),
         }
+        if include_contact:
+            payload["contact_email"] = self.contact_email
+        return payload
 
     def reward_catalog_entry(self):
         return {
@@ -1231,7 +1244,7 @@ def register_business():
     db.session.add(business)
     db.session.commit()
 
-    return jsonify(business.to_dict()), 201
+    return jsonify(business.to_dict(include_contact=True)), 201
 
 
 @app.route("/nearby-businesses", methods=["GET"])
