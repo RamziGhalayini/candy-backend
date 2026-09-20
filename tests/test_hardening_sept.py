@@ -4,6 +4,8 @@ Each test here was written to FAIL against the code as it stood before that
 pass. They are the reason to believe the fixes do what the commit says.
 """
 
+import io
+
 import pytest
 
 import app as app_module
@@ -103,5 +105,79 @@ def test_registered_stop_always_has_an_owner(client):
     with app_module.app.app_context():
         stop = app_module.db.session.get(app_module.Stop, stop_id)
         assert stop.registrant_device_id == "dev-with-space"
+
+
+# --------------------------------------------------------------------------
+# 3. greeting uploads are checked by content, not by caller-chosen strings
+# --------------------------------------------------------------------------
+
+_M4A = b"\x00\x00\x00\x20ftypM4A " + b"\x00" * 64
+_NOT_AUDIO = b"<!DOCTYPE html><html><body>not audio at all</body></html>" + b"\x00" * 64
+
+
+def _upload(client, stop_id, payload, filename="greeting.m4a", content_type="audio/m4a"):
+    return client.post(
+        f"/upload-greeting/{stop_id}",
+        data={
+            "device_id": "dev-owner",
+            "audio": (io.BytesIO(payload), filename, content_type),
+        },
+        content_type="multipart/form-data",
+    )
+
+
+def test_upload_rejects_non_audio_bytes_even_with_a_valid_name_and_type(client, monkeypatch):
+    """The exact attack: correct extension, correct content-type, junk inside."""
+    stop_id = _register(client).get_json()["id"]
+
+    class _FakeR2:
+        def put_object(self, **kwargs):  # pragma: no cover - must not be reached
+            raise AssertionError("non-audio content reached object storage")
+
+    monkeypatch.setattr(app_module, "r2_client", _FakeR2())
+
+    response = _upload(client, stop_id, _NOT_AUDIO)
+    assert response.status_code == 400
+    assert "audio" in response.get_json()["error"]
+
+
+def test_upload_accepts_a_real_m4a_container(client, monkeypatch):
+    stop_id = _register(client).get_json()["id"]
+
+    captured = {}
+
+    class _FakeR2:
+        def put_object(self, **kwargs):
+            captured.update(kwargs)
+            return {}
+
+    monkeypatch.setattr(app_module, "r2_client", _FakeR2())
+
+    response = _upload(client, stop_id, _M4A)
+    assert response.status_code == 200, response.get_json()
+    assert captured["Body"] == _M4A
+
+
+def test_looks_like_audio_signatures():
+    ok = [
+        b"\x00\x00\x00\x20ftypM4A " + b"\x00" * 8,
+        b"ID3\x04\x00\x00\x00\x00\x00\x00\x00\x00",
+        b"\xff\xfb\x90\x00" + b"\x00" * 8,
+        b"RIFF\x24\x08\x00\x00WAVE",
+        b"OggS\x00\x02\x00\x00\x00\x00\x00\x00",
+        b"\x1a\x45\xdf\xa3\x01\x00\x00\x00\x00\x00\x00\x00",
+    ]
+    for payload in ok:
+        assert app_module._looks_like_audio(payload), payload[:8]
+
+    bad = [
+        b"",
+        b"short",
+        b"<!DOCTYPE html><html>",
+        b"%PDF-1.7\x00\x00\x00\x00",
+        b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00",
+    ]
+    for payload in bad:
+        assert not app_module._looks_like_audio(payload), payload[:8]
 
 

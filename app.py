@@ -849,6 +849,36 @@ def report_stop(stop_id):
 # CheckIn's unique constraint) and hides the stop at zero.
 
 
+def _looks_like_audio(payload):
+    """True when the leading bytes match a container this app actually records.
+
+    Deliberately a small allowlist of signatures, not a full parser. It is a
+    sanity check on content the server is about to host publicly and play to
+    children, not a guarantee the file decodes.
+
+    Covered: ISO-BMFF (.m4a/.aac/.caf via 'ftyp' at offset 4), ID3-tagged MP3,
+    bare MPEG audio frame sync, RIFF/WAVE, Ogg, and Matroska/WebM.
+    """
+    if len(payload) < 12:
+        return False
+    head = payload[:12]
+    if head[4:8] == b"ftyp":
+        return True
+    if head[:3] == b"ID3":
+        return True
+    if head[0] == 0xFF and (head[1] & 0xE0) == 0xE0:
+        return True
+    if head[:4] == b"RIFF" and head[8:12] == b"WAVE":
+        return True
+    if head[:4] == b"OggS":
+        return True
+    if head[:4] == b"\x1a\x45\xdf\xa3":
+        return True
+    if head[:4] == b"caff":
+        return True
+    return False
+
+
 @app.route("/upload-greeting/<int:stop_id>", methods=["POST"])
 def upload_greeting(stop_id):
     # Multipart, so the device id rides in the form fields rather than a JSON
@@ -885,6 +915,13 @@ def upload_greeting(stop_id):
     audio_bytes = audio_file.read()
     if not audio_bytes:
         return jsonify({"error": "audio file is empty"}), 400
+
+    # Both checks above are on strings the CALLER chose. A file named x.m4a
+    # sent as audio/m4a passes them while containing anything at all -- and
+    # this object ends up on a public bucket URL and auto-plays to a child on
+    # check-in. Look at the actual bytes.
+    if not _looks_like_audio(audio_bytes):
+        return jsonify({"error": "file must be an audio recording"}), 400
     if len(audio_bytes) > MAX_GREETING_BYTES:
         max_mb = MAX_GREETING_BYTES // (1024 * 1024)
         return jsonify({"error": f"audio file must be under {max_mb}MB"}), 400

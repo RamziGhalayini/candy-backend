@@ -20,10 +20,18 @@ def _register_stop(client, **overrides):
     return response.get_json()["id"]
 
 
+# /upload-greeting now checks the leading bytes, not just the filename and
+# content-type the caller chose, so a placeholder body no longer passes. This
+# is a minimal ISO-BMFF header ('ftyp' at offset 4) plus filler -- still fake
+# audio, but shaped like the container the app actually records. Content
+# validation itself is covered in tests/test_hardening_sept.py.
+FAKE_M4A = b"\x00\x00\x00\x20ftypM4A " + b"fake-audio-bytes"
+
+
 def _audio_file(
     name="greeting.m4a",
     content_type="audio/m4a",
-    body=b"fake-audio-bytes",
+    body=FAKE_M4A,
     device_id="greeter-1",
 ):
     """Multipart payload for an upload. device_id defaults to the same device
@@ -54,7 +62,7 @@ def test_upload_greeting_succeeds_and_sets_url(client, monkeypatch):
     call_kwargs = mock_r2.put_object.call_args.kwargs
     assert call_kwargs["Bucket"] == app_module.R2_BUCKET_NAME
     assert call_kwargs["ContentType"] == "audio/m4a"
-    assert call_kwargs["Body"] == b"fake-audio-bytes"
+    assert call_kwargs["Body"] == FAKE_M4A
 
     stored = db.session.get(Stop, stop_id)
     assert stored.greeting_audio_url == body["greeting_audio_url"]
@@ -78,7 +86,7 @@ def test_upload_greeting_rejects_oversized_file(client, monkeypatch):
     stop_id = _register_stop(client)
     monkeypatch.setattr(app_module, "r2_client", MagicMock())
 
-    big_body = b"a" * (2 * 1024 * 1024 + 1)
+    big_body = FAKE_M4A + b"a" * (2 * 1024 * 1024 + 1)
     response = client.post(
         f"/upload-greeting/{stop_id}",
         data=_audio_file(body=big_body),
@@ -181,7 +189,7 @@ def test_upload_greeting_does_not_overwrite_an_existing_greeting(client, monkeyp
 
     response = client.post(
         f"/upload-greeting/{stop_id}",
-        data=_audio_file(body=b"malicious-audio", device_id="not-the-owner"),
+        data=_audio_file(body=FAKE_M4A, device_id="not-the-owner"),
         content_type="multipart/form-data",
     )
 
