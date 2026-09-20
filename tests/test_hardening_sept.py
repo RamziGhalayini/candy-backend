@@ -216,6 +216,28 @@ def test_a_failing_purge_does_not_discard_the_check_in(client, monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# 6. /my-stops still reports verification correctly after the N+1 fix
+# --------------------------------------------------------------------------
+
+def test_my_stops_reports_verified_using_a_neighbour_not_owned_by_the_caller(client):
+    """The universe for verification is geographic, not per-device. If the fix
+    had filtered by owner, an owner's genuinely verified stop would report as
+    unverified -- and check-ins would then be rejected at that address."""
+    owner = "owner-device"
+    _register(client, device_id=owner, lat=28.7600, lon=-81.3300, name="Mine")
+    _register(client, device_id="a-neighbour", lat=28.76002, lon=-81.33002, name="Theirs")
+
+    rows = client.get(f"/my-stops/{owner}").get_json()
+    assert len(rows) == 1
+    assert rows[0]["name"] == "Mine"
+    assert rows[0]["verified"] is True
+
+
+def test_my_stops_empty_for_unknown_device(client):
+    assert client.get("/my-stops/nobody-here").get_json() == []
+
+
+# --------------------------------------------------------------------------
 # 3. greeting uploads are checked by content, not by caller-chosen strings
 # --------------------------------------------------------------------------
 

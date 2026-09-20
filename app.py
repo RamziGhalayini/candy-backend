@@ -1092,8 +1092,35 @@ def upload_greeting(stop_id):
 
 @app.route("/my-stops/<device_id>", methods=["GET"])
 def my_stops(device_id):
+    """The owner's own listings.
+
+    Each to_dict() used to call is_verified(), which issues its own COUNT --
+    N+1 queries for a list of N stops, same shape as the one removed from
+    /nearby-stops. The lists here are small (one household's own stops), so
+    this was never the DoS that route was, but the fix is the same helper and
+    costs nothing.
+
+    The universe passed to _verified_stop_ids must contain every stop that
+    could verify one of these, which is NOT just the owner's own stops -- a
+    neighbour's registration is what verifies you. Fetch by bounding box
+    around each owned stop rather than filtering by device.
+    """
     stops = Stop.query.filter_by(registrant_device_id=device_id).all()
-    return jsonify([stop.to_dict() for stop in stops])
+    if not stops:
+        return jsonify([])
+
+    tolerance = VERIFICATION_TOLERANCE_DEGREES
+    clauses = [
+        db.and_(
+            Stop.latitude.between(stop.latitude - tolerance, stop.latitude + tolerance),
+            Stop.longitude.between(stop.longitude - tolerance, stop.longitude + tolerance),
+        )
+        for stop in stops
+    ]
+    universe = Stop.query.filter(db.or_(*clauses)).all()
+    verified_ids = _verified_stop_ids(stops, universe)
+
+    return jsonify([stop.to_dict(verified=stop.id in verified_ids) for stop in stops])
 
 
 @app.route("/update-stop/<int:stop_id>", methods=["PATCH"])
