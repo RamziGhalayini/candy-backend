@@ -55,10 +55,21 @@ app = Flask(__name__)
 
 database_url = os.environ.get("DATABASE_URL")
 if database_url:
-    # Render (and some other providers) hand out "postgres://", but
-    # SQLAlchemy's psycopg2 dialect requires "postgresql://".
+    # Render (and some other providers) hand out "postgres://", which
+    # SQLAlchemy does not accept. Normalise it, and name the driver
+    # explicitly rather than relying on SQLAlchemy's default.
+    #
+    # SQLAlchemy 2.1 defaults a bare "postgresql://" URL to the psycopg 3
+    # dialect, and requirements.txt installs psycopg2-binary, so the URL
+    # names psycopg2 explicitly.
     if database_url.startswith("postgres://"):
-        database_url = database_url.replace("postgres://", "postgresql://", 1)
+        database_url = database_url.replace(
+            "postgres://", "postgresql+psycopg2://", 1
+        )
+    elif database_url.startswith("postgresql://"):
+        database_url = database_url.replace(
+            "postgresql://", "postgresql+psycopg2://", 1
+        )
     app.config["SQLALCHEMY_DATABASE_URI"] = database_url
 else:
     basedir = os.path.abspath(os.path.dirname(__file__))
