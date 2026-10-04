@@ -45,6 +45,7 @@ library or a silent wrong answer.
 """
 
 import glob
+import logging
 import os
 
 from appstoreserverlibrary.api_client import APIError, APIException, AppStoreServerAPIClient
@@ -53,6 +54,8 @@ from appstoreserverlibrary.models.JWSTransactionDecodedPayload import JWSTransac
 from appstoreserverlibrary.signed_data_verifier import SignedDataVerifier, VerificationException
 
 _REQUIRED_ENV_VARS = ("APPLE_ISSUER_ID", "APPLE_KEY_ID", "APPLE_PRIVATE_KEY", "APPLE_BUNDLE_ID")
+
+logger = logging.getLogger(__name__)
 
 
 class AppleVerificationConfigError(RuntimeError):
@@ -134,11 +137,21 @@ def verify_transaction(transaction_id: str, expected_product_id: str) -> JWSTran
     decoded JWSTransactionDecodedPayload if it's a genuine, non-revoked
     purchase of `expected_product_id`.
 
-    Tries PRODUCTION first, falls back to SANDBOX only on Apple's specific
-    "transaction not found in this environment" signal (APIError.
-    TRANSACTION_ID_NOT_FOUND with http_status_code 404) -- Apple's own
-    documented pattern for supporting sandbox/TestFlight purchases against
-    a production-configured server.
+    Tries PRODUCTION first, falls back to SANDBOX on two signals:
+
+      - Apple's specific "transaction not found in this environment"
+        (APIError.TRANSACTION_ID_NOT_FOUND with http_status_code 404) --
+        Apple's own documented pattern for supporting sandbox/TestFlight
+        purchases against a production-configured server.
+      - A bare 401 from the PRODUCTION host only. OBSERVED 2026-10-04 with
+        a throwaway probe using this same library version and the same
+        key/issuer/bundle: sandbox answered 200 with a signed transaction,
+        production answered 401 with no error body. The credentials are
+        therefore valid; production is refusing them. REASONED, not
+        confirmed by Apple's docs: production refuses because the app has
+        never been released on the App Store. Logged at warning level so a
+        real credential problem stays visible. A 401 from SANDBOX is still a
+        hard failure.
 
     bundleId and environment are already validated by SignedDataVerifier
     itself (confirmed in its source: verify_and_decode_signed_transaction
@@ -159,6 +172,13 @@ def verify_transaction(transaction_id: str, expected_product_id: str) -> JWSTran
             response = client.get_transaction_info(transaction_id)
         except APIException as error:
             if error.api_error == APIError.TRANSACTION_ID_NOT_FOUND and error.http_status_code == 404:
+                last_error = error
+                continue
+            if environment == Environment.PRODUCTION and error.http_status_code == 401:
+                logger.warning(
+                    "Apple production host returned 401 for transaction %s; trying sandbox",
+                    transaction_id,
+                )
                 last_error = error
                 continue
             raise AppleVerificationError(f"Apple API error verifying transaction: {error}") from error
