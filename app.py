@@ -14,7 +14,6 @@
 
 import hashlib
 import hmac
-import json
 import math
 import os
 import secrets
@@ -146,7 +145,6 @@ REPORT_HIDE_THRESHOLD = 5
 # device_id -- no accounts, no personal info.
 CHECKIN_POINTS = 5
 VERIFICATION_BONUS_POINTS = 10
-TRIVIA_POINTS = 10
 CHECKIN_RADIUS_METERS = 75
 CHECKIN_MILESTONE_INTERVAL = 20
 
@@ -200,10 +198,6 @@ CHECKIN_RETENTION_DAYS = 400
 BUSINESS_REWARD_DEFAULT_POINTS_COST = 25
 
 basedir = os.path.abspath(os.path.dirname(__file__))
-with open(os.path.join(basedir, "trivia_questions.json")) as f:
-    TRIVIA_QUESTIONS = json.load(f)
-with open(os.path.join(basedir, "rewards_catalog.json")) as f:
-    REWARDS_CATALOG = json.load(f)
 
 
 class Stop(db.Model):
@@ -290,7 +284,11 @@ class CheckIn(db.Model):
 
 
 class TriviaAnswer(db.Model):
-    """Records a device's one scored trivia attempt for a given day."""
+    """Records a device's one scored trivia attempt for a given day.
+
+    The trivia routes were retired on 2026-10-17; nothing reads or writes
+    this table any more. The model stays because the production table and
+    its rows stay -- retiring the feature must not drop or alter data."""
 
     id = db.Column(db.Integer, primary_key=True)
     device_id = db.Column(db.String, nullable=False, index=True)
@@ -690,7 +688,8 @@ def _maybe_award_verification_bonus(stop):
 #     stop, reporting one, uploading audio, registering a business) get real
 #     limits. Even a whole street does not register thirty houses an hour.
 #
-#   - Routes on the normal-use path (searching, checking in, trivia) get
+#   - Routes on the normal-use path (searching, checking in, redeeming a
+#     business perk) get
 #     limits high enough that no plausible NAT pool reaches them, which means
 #     they only stop a single-source flood taking down the one worker. They
 #     were never going to stop a determined harvester anyway -- the radius cap
@@ -716,7 +715,6 @@ _RATE_LIMITS = {
     "check_in": (2000, 3600),
     "check_in_batch": (600, 3600),
     "redeem_reward": (600, 3600),
-    "trivia_answer": (600, 3600),
 }
 
 _RATE_BUCKETS = {}
@@ -1553,77 +1551,18 @@ def nearby_businesses():
     )
 
 
-@app.route("/trivia/today", methods=["GET"])
-def trivia_today():
-    today = date.today()
-    question = TRIVIA_QUESTIONS[today.toordinal() % len(TRIVIA_QUESTIONS)]
-
-    result = {
-        "id": question["id"],
-        "question": question["question"],
-        "choices": question["choices"],
-    }
-
-    device_id = request.args.get("device_id")
-    if device_id:
-        answered = TriviaAnswer.query.filter_by(device_id=device_id, answer_date=today).first()
-        result["already_answered"] = answered is not None
-        result["was_correct"] = answered.was_correct if answered is not None else None
-
-    return jsonify(result)
-
-
-@app.route("/trivia/answer", methods=["POST"])
-def trivia_answer():
-    data = request.get_json(silent=True) or {}
-
-    device_id = data.get("device_id")
-    answer = data.get("answer")
-
-    if not device_id or answer is None:
-        return jsonify({"error": "device_id and answer are required"}), 400
-
-    today = date.today()
-    if TriviaAnswer.query.filter_by(device_id=device_id, answer_date=today).first() is not None:
-        return jsonify({"error": "already answered today's trivia question"}), 400
-
-    question = TRIVIA_QUESTIONS[today.toordinal() % len(TRIVIA_QUESTIONS)]
-    correct = answer == question["correct_index"]
-
-    db.session.add(
-        TriviaAnswer(
-            device_id=device_id,
-            answer_date=today,
-            question_id=question["id"],
-            was_correct=correct,
-        )
-    )
-
-    points_awarded = 0
-    if correct:
-        household = _award_points(device_id, TRIVIA_POINTS)
-        points_awarded = TRIVIA_POINTS
-    else:
-        household = _get_or_create_household(device_id)
-
-    db.session.commit()
-
-    return jsonify({"correct": correct, "points_awarded": points_awarded, "points_total": household.points})
-
-
-@app.route("/rewards-catalog", methods=["GET"])
-def rewards_catalog():
-    business_entries = [business.reward_catalog_entry() for business in Business.query.all()]
-    return jsonify(REWARDS_CATALOG + business_entries)
+# Retired 2026-10-17: GET /trivia/today, POST /trivia/answer and
+# GET /rewards-catalog, together with trivia_questions.json and
+# rewards_catalog.json (the founder-brand catalog). The only rewards left are
+# the perks registered businesses offer, redeemed below by
+# "business-<Business.id>". The trivia_answer and redemption tables and their
+# rows are untouched.
 
 
 def _find_reward(reward_id):
-    """Look up a reward by id from either the static catalog or a
-    registered business's reward_offer (id shaped "business-<Business.id>")."""
-    reward = next((r for r in REWARDS_CATALOG if r["id"] == reward_id), None)
-    if reward is not None:
-        return reward
-
+    """Look up a registered business's reward_offer by id
+    ("business-<Business.id>"). Any other id -- including the ids the
+    retired founder catalog used to serve -- resolves to None."""
     if reward_id.startswith("business-"):
         try:
             business_id = int(reward_id[len("business-") :])
@@ -1697,6 +1636,9 @@ def get_redemptions(device_id):
 
     result = []
     for redemption in redemptions:
+        # A redemption of a founder-catalog reward made before 2026-10-17 no
+        # longer resolves (that catalog is gone); its row still lists, with
+        # the raw reward_id as its name and no sponsor.
         reward = _find_reward(redemption.reward_id)
         result.append(
             {

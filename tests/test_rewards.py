@@ -1,11 +1,29 @@
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 
-from app import REWARDS_CATALOG, TRIVIA_QUESTIONS, Household, Redemption, Stop, db
+from app import Household, Redemption, Stop, db
 
 
-def _todays_question():
-    today = date.today()
-    return TRIVIA_QUESTIONS[today.toordinal() % len(TRIVIA_QUESTIONS)]
+def _business_reward(client, name="Sweet Tooth Bakery", offer="Free mini donut", points_cost=40):
+    """Registers a business and returns the reward dict the redeem and history
+    routes work from: id ("business-<id>"), name, sponsor_name, points_cost."""
+    response = client.post(
+        "/register-business",
+        json={
+            "name": name,
+            "address": "12 Main St",
+            "latitude": 42.0,
+            "longitude": -71.0,
+            "category": "bakery",
+            "description": "A short description.",
+            "contact_email": "owner@example.test",
+            "reward_offer": offer,
+            "device_id": "biz-registrant-1",
+            "points_cost": points_cost,
+        },
+    )
+    assert response.status_code == 201
+    business_id = response.get_json()["id"]
+    return {"id": f"business-{business_id}", "name": offer, "sponsor_name": name, "points_cost": points_cost}
 
 
 def _make_verified_stop(client, device_id="registrant-1", lat=42.0, lon=-71.0):
@@ -145,88 +163,11 @@ def test_verification_bonus_awarded_once_to_original_registrant(client):
     assert household.points == 10
 
 
-# ── Trivia ────────────────────────────────────────────────────────────────
-
-
-def test_trivia_correct_answer_awards_points_once(client):
-    question = _todays_question()
-
-    response = client.post(
-        "/trivia/answer",
-        json={"device_id": "trivia-1", "answer": question["correct_index"]},
-    )
-
-    assert response.status_code == 200
-    body = response.get_json()
-    assert body == {"correct": True, "points_awarded": 10, "points_total": 10}
-
-
-def test_trivia_incorrect_answer_awards_no_points(client):
-    question = _todays_question()
-    wrong_index = (question["correct_index"] + 1) % len(question["choices"])
-
-    response = client.post(
-        "/trivia/answer",
-        json={"device_id": "trivia-1", "answer": wrong_index},
-    )
-
-    assert response.status_code == 200
-    body = response.get_json()
-    assert body == {"correct": False, "points_awarded": 0, "points_total": 0}
-
-
-def test_trivia_second_answer_same_day_rejected(client):
-    question = _todays_question()
-    payload = {"device_id": "trivia-1", "answer": question["correct_index"]}
-
-    first = client.post("/trivia/answer", json=payload)
-    second = client.post("/trivia/answer", json=payload)
-
-    assert first.status_code == 200
-    assert second.status_code == 400
-    assert "already answered" in second.get_json()["error"]
-
-
 # ── Redemption ────────────────────────────────────────────────────────────
-
-
-def test_redeem_reward_deducts_points_and_returns_code(client):
-    household = Household(device_id="redeemer-1", points=100)
-    db.session.add(household)
-    db.session.commit()
-
-    reward = REWARDS_CATALOG[0]
-
-    response = client.post(
-        f"/redeem-reward/{reward['id']}",
-        json={"device_id": "redeemer-1"},
-    )
-
-    assert response.status_code == 200
-    body = response.get_json()
-    assert body["points_remaining"] == 100 - reward["points_cost"]
-    assert body["code"].startswith("TM-")
-
-    redemption = Redemption.query.filter_by(device_id="redeemer-1").first()
-    assert redemption is not None
-    assert redemption.code == body["code"]
-    assert redemption.points_spent == reward["points_cost"]
-
-
-def test_redeem_reward_insufficient_points_rejected(client):
-    household = Household(device_id="poor-1", points=1)
-    db.session.add(household)
-    db.session.commit()
-
-    reward = REWARDS_CATALOG[0]
-
-    response = client.post(
-        f"/redeem-reward/{reward['id']}",
-        json={"device_id": "poor-1"},
-    )
-
-    assert response.status_code == 400
-    assert "enough points" in response.get_json()["error"]
+# Business perks only: the founder catalog was retired on 2026-10-17 (see
+# tests/test_trivia_and_founder_rewards_removed.py). Deduction, insufficient
+# points and repeat-redemption of a business perk are pinned in
+# tests/test_business_rewards.py.
 
 
 def test_redeem_reward_unknown_id_returns_404(client):
@@ -242,48 +183,19 @@ def test_redeem_reward_unknown_id_returns_404(client):
     assert response.status_code == 404
 
 
-def test_redeem_reward_rejects_second_redemption_of_same_reward(client):
-    household = Household(device_id="repeat-redeemer", points=1000)
-    db.session.add(household)
-    db.session.commit()
-
-    reward = REWARDS_CATALOG[0]
-    payload = {"device_id": "repeat-redeemer"}
-
-    first = client.post(f"/redeem-reward/{reward['id']}", json=payload)
-    second = client.post(f"/redeem-reward/{reward['id']}", json=payload)
-
-    assert first.status_code == 200
-    assert second.status_code == 400
-    assert "already redeemed" in second.get_json()["error"]
-
-    # Points were only spent once.
-    assert db.session.get(Household, household.id).points == 1000 - reward["points_cost"]
-    assert Redemption.query.filter_by(device_id="repeat-redeemer", reward_id=reward["id"]).count() == 1
-
-
 def test_redeem_reward_allows_a_different_reward_after_first(client):
     household = Household(device_id="multi-redeemer", points=1000)
     db.session.add(household)
     db.session.commit()
 
-    first_reward, second_reward = REWARDS_CATALOG[0], REWARDS_CATALOG[1]
+    first_reward = _business_reward(client, name="First Shop", offer="First perk")
+    second_reward = _business_reward(client, name="Second Shop", offer="Second perk")
 
     first = client.post(f"/redeem-reward/{first_reward['id']}", json={"device_id": "multi-redeemer"})
     second = client.post(f"/redeem-reward/{second_reward['id']}", json={"device_id": "multi-redeemer"})
 
     assert first.status_code == 200
     assert second.status_code == 200
-
-
-def test_rewards_catalog_returns_seeded_list(client):
-    response = client.get("/rewards-catalog")
-
-    assert response.status_code == 200
-    body = response.get_json()
-    assert len(body) == len(REWARDS_CATALOG)
-    expected_keys = {"id", "name", "points_cost", "sponsor_name", "sponsor_type", "image_url"}
-    assert expected_keys <= set(body[0].keys())
 
 
 def test_points_lookup_defaults_to_zero_without_creating_household(client):
@@ -558,7 +470,7 @@ def test_get_redemptions_returns_history_with_expected_fields(client):
     db.session.add(household)
     db.session.commit()
 
-    reward = REWARDS_CATALOG[0]
+    reward = _business_reward(client)
     redeem_response = client.post(f"/redeem-reward/{reward['id']}", json={"device_id": "history-1"})
     code = redeem_response.get_json()["code"]
 
@@ -581,7 +493,8 @@ def test_get_redemptions_sorted_most_recent_first(client):
     db.session.add(household)
     db.session.commit()
 
-    first_reward, second_reward = REWARDS_CATALOG[0], REWARDS_CATALOG[1]
+    first_reward = _business_reward(client, name="First Shop", offer="First perk")
+    second_reward = _business_reward(client, name="Second Shop", offer="Second perk")
     client.post(f"/redeem-reward/{first_reward['id']}", json={"device_id": "history-2"})
     client.post(f"/redeem-reward/{second_reward['id']}", json={"device_id": "history-2"})
 
@@ -682,7 +595,7 @@ def test_get_redemptions_only_returns_that_devices_history(client):
     db.session.add_all([household_a, household_b])
     db.session.commit()
 
-    reward = REWARDS_CATALOG[0]
+    reward = _business_reward(client)
     client.post(f"/redeem-reward/{reward['id']}", json={"device_id": "history-a"})
 
     response = client.get("/redemptions/history-b")

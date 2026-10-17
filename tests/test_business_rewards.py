@@ -57,35 +57,6 @@ def test_nearby_businesses_includes_points_cost(client):
     assert response.get_json()[0]["points_cost"] == 15
 
 
-# ── Rewards catalog ───────────────────────────────────────────────────────
-
-
-def test_rewards_catalog_includes_registered_business(client):
-    _register_business(client, name="Village Toy Shop", reward_offer="Free sticker sheet")
-
-    response = client.get("/rewards-catalog")
-
-    assert response.status_code == 200
-    body = response.get_json()
-    business_entries = [item for item in body if item["id"].startswith("business-")]
-    assert len(business_entries) == 1
-    entry = business_entries[0]
-    assert entry["name"] == "Free sticker sheet"
-    assert entry["sponsor_name"] == "Village Toy Shop"
-    assert entry["sponsor_type"] == "local_business"
-    assert entry["points_cost"] == BUSINESS_REWARD_DEFAULT_POINTS_COST
-
-
-def test_rewards_catalog_reflects_custom_business_points_cost(client):
-    register_response = _register_business(client, points_cost=60)
-    business_id = register_response.get_json()["id"]
-
-    response = client.get("/rewards-catalog")
-
-    entry = next(item for item in response.get_json() if item["id"] == f"business-{business_id}")
-    assert entry["points_cost"] == 60
-
-
 # ── Redemption ────────────────────────────────────────────────────────────
 
 
