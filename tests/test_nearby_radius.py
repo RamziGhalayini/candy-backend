@@ -203,3 +203,185 @@ def test_report_count_is_not_in_the_response(client):
     listed = client.get("/nearby-stops?lat=42.0&lon=-71.0&radius=1").get_json()
     assert listed
     assert all("report_count" not in s for s in listed)
+
+
+# ---------------------------------------------------------------------------
+# POST bodies (2026-10-25). The gunicorn access line in Render's app log
+# records the request path with its query string, so a GET search wrote the
+# caller's lat/lon into a log kept for days. Both search routes now also take
+# POST with a JSON body. These pin: same results, same 400s, same rate-limit
+# bucket, and GET untouched.
+# ---------------------------------------------------------------------------
+
+
+def test_nearby_stops_post_returns_the_same_results_as_get(client):
+    _register_stop(client, name="Close", latitude=42.0, longitude=-71.0)
+    _register_stop(client, name="Edge", latitude=42.008, longitude=-71.0)
+    _register_stop(client, name="Far", latitude=45.0, longitude=-71.0)
+
+    via_get = client.get("/nearby-stops?lat=42.0&lon=-71.0&radius=1")
+    via_post = client.post("/nearby-stops", json={"lat": 42.0, "lon": -71.0, "radius": 1})
+
+    assert via_get.status_code == 200
+    assert via_post.status_code == 200
+    assert via_post.get_json() == via_get.get_json()
+    assert [s["name"] for s in via_post.get_json()] == ["Close", "Edge"]
+
+
+def test_nearby_stops_post_accepts_numbers_sent_as_strings(client):
+    """A client that stringifies its numbers still gets the GET answer."""
+    _register_stop(client, name="Close")
+
+    via_get = client.get("/nearby-stops?lat=42.0&lon=-71.0&radius=1")
+    via_post = client.post("/nearby-stops", json={"lat": "42.0", "lon": "-71.0", "radius": "1"})
+
+    assert via_post.status_code == 200
+    assert via_post.get_json() == via_get.get_json()
+
+
+def test_nearby_stops_post_omitted_radius_defaults_to_one_km(client):
+    _register_stop(client, name="Close", latitude=42.0, longitude=-71.0)
+    _register_stop(client, name="Far", latitude=45.0, longitude=-71.0)
+
+    response = client.post("/nearby-stops", json={"lat": 42.0, "lon": -71.0})
+
+    assert response.status_code == 200
+    assert [s["name"] for s in response.get_json()] == ["Close"]
+
+
+def test_nearby_stops_post_bad_input_gives_the_same_400s_as_get(client):
+    """Each row is (GET query, POST body); the two must agree on status and
+    message. The messages are the GET ones verbatim, including the words
+    'query params' -- candy-app matches on status, not text."""
+    cases = [
+        ("lat=42.0&radius=1", {"lat": 42.0, "radius": 1}),
+        ("lat=abc&lon=-71.0", {"lat": "abc", "lon": -71.0}),
+        ("lat=inf&lon=-71.0", {"lat": "inf", "lon": -71.0}),
+        ("lat=91.0&lon=-71.0", {"lat": 91.0, "lon": -71.0}),
+        ("lat=42.0&lon=-71.0&radius=99%2C999", {"lat": 42.0, "lon": -71.0, "radius": "99,999"}),
+        ("lat=42.0&lon=-71.0&radius=", {"lat": 42.0, "lon": -71.0, "radius": ""}),
+        ("lat=42.0&lon=-71.0&radius=nan", {"lat": 42.0, "lon": -71.0, "radius": "nan"}),
+        ("lat=42.0&lon=-71.0&radius=0", {"lat": 42.0, "lon": -71.0, "radius": 0}),
+        ("lat=42.0&lon=-71.0&radius=99999", {"lat": 42.0, "lon": -71.0, "radius": 99999}),
+    ]
+    for query, body in cases:
+        via_get = client.get(f"/nearby-stops?{query}")
+        via_post = client.post("/nearby-stops", json=body)
+
+        assert via_get.status_code == 400, query
+        assert via_post.status_code == 400, body
+        assert via_post.get_json() == via_get.get_json(), body
+
+
+def test_nearby_stops_post_rejects_json_types_a_query_string_cannot_carry(client):
+    """float() raises TypeError on a list or object and turns True into 1.0.
+    None of those is a coordinate; all of them 400 with the GET message
+    rather than 500 or silently searching from (1, 1)."""
+    for lat in ([42.0], {"value": 42.0}, True):
+        response = client.post("/nearby-stops", json={"lat": lat, "lon": -71.0})
+
+        assert response.status_code == 400, lat
+        assert response.get_json()["error"] == "lat and lon must be numbers", lat
+
+    response = client.post("/nearby-stops", json={"lat": 42.0, "lon": -71.0, "radius": [1]})
+    assert response.status_code == 400
+    assert response.get_json()["error"] == "radius must be a number"
+
+
+def test_nearby_stops_post_without_a_json_object_is_a_missing_origin(client):
+    """No body, a non-JSON body, and a JSON list all read as an empty mapping
+    and get the 400 a bare GET gets -- never a 500."""
+    expected = client.get("/nearby-stops").get_json()
+
+    no_body = client.post("/nearby-stops")
+    not_json = client.post("/nearby-stops", data="lat=42.0&lon=-71.0", content_type="text/plain")
+    a_list = client.post("/nearby-stops", json=[42.0, -71.0])
+
+    for response in (no_body, not_json, a_list):
+        assert response.status_code == 400
+        assert response.get_json() == expected
+
+
+def test_nearby_stops_post_ignores_the_query_string(client):
+    """A POST reads the body only. If the query string also counted, the
+    coordinates would be back in the access line by accident."""
+    _register_stop(client, name="Close", latitude=42.0, longitude=-71.0)
+
+    response = client.post("/nearby-stops?lat=42.0&lon=-71.0&radius=1", json={})
+
+    assert response.status_code == 400
+    assert response.get_json()["error"] == "lat and lon query params are required"
+
+
+def test_nearby_stops_get_and_post_share_one_rate_limit_bucket(client, monkeypatch):
+    """One view function serves both methods, so request.endpoint -- the
+    limiter's key -- is the same string either way. Lowered budget: the
+    real one is 2000/hr and spending it in a test proves nothing extra."""
+    import app as app_module
+
+    monkeypatch.setitem(app_module._RATE_LIMITS, "nearby_stops", (5, 3600))
+    headers = {"X-Forwarded-For": "203.0.113.40"}
+    body = {"lat": 42.0, "lon": -71.0, "radius": 1}
+
+    for _ in range(3):
+        assert client.get("/nearby-stops?lat=42.0&lon=-71.0&radius=1", headers=headers).status_code == 200
+    for _ in range(2):
+        assert client.post("/nearby-stops", json=body, headers=headers).status_code == 200
+
+    blocked_post = client.post("/nearby-stops", json=body, headers=headers)
+    blocked_get = client.get("/nearby-stops?lat=42.0&lon=-71.0&radius=1", headers=headers)
+
+    assert blocked_post.status_code == 429
+    assert blocked_get.status_code == 429, "a GET after five mixed calls is the sixth call"
+
+
+def test_nearby_businesses_post_returns_the_same_results_as_get(client):
+    _register_business(client, name="Close Shop", latitude=42.0, longitude=-71.0)
+    _register_business(client, name="Far Shop", latitude=45.0, longitude=-71.0)
+
+    via_get = client.get("/nearby-businesses?lat=42.0&lon=-71.0&radius=1")
+    via_post = client.post("/nearby-businesses", json={"lat": 42.0, "lon": -71.0, "radius": 1})
+
+    assert via_get.status_code == 200
+    assert via_post.status_code == 200
+    assert via_post.get_json() == via_get.get_json()
+    assert [b["name"] for b in via_post.get_json()] == ["Close Shop"]
+
+
+def test_nearby_businesses_post_bad_input_gives_the_same_400s_as_get(client):
+    cases = [
+        ("lon=-71.0", {"lon": -71.0}),
+        ("lat=42.0&lon=-71.0&radius=99%2C999", {"lat": 42.0, "lon": -71.0, "radius": "99,999"}),
+        ("lat=42.0&lon=-71.0&radius=99999", {"lat": 42.0, "lon": -71.0, "radius": 99999}),
+    ]
+    for query, body in cases:
+        via_get = client.get(f"/nearby-businesses?{query}")
+        via_post = client.post("/nearby-businesses", json=body)
+
+        assert via_get.status_code == 400, query
+        assert via_post.status_code == 400, body
+        assert via_post.get_json() == via_get.get_json(), body
+
+
+def test_nearby_businesses_get_and_post_share_one_rate_limit_bucket(client, monkeypatch):
+    import app as app_module
+
+    monkeypatch.setitem(app_module._RATE_LIMITS, "nearby_businesses", (4, 3600))
+    headers = {"X-Forwarded-For": "203.0.113.41"}
+    body = {"lat": 42.0, "lon": -71.0, "radius": 1}
+
+    for _ in range(2):
+        assert client.get("/nearby-businesses?lat=42.0&lon=-71.0&radius=1", headers=headers).status_code == 200
+    for _ in range(2):
+        assert client.post("/nearby-businesses", json=body, headers=headers).status_code == 200
+
+    assert client.post("/nearby-businesses", json=body, headers=headers).status_code == 429
+
+
+def test_nearby_searches_still_answer_head_requests(client):
+    """The uptime monitor hits HEAD /nearby-stops?lat=0&lon=0 every few
+    minutes (OBSERVED in Render's logs, 2026-10-25). Adding POST must not
+    take HEAD away from the GET rule."""
+    response = client.head("/nearby-stops?lat=0&lon=0")
+
+    assert response.status_code == 200

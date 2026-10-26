@@ -855,6 +855,20 @@ class _InvalidSearchArgs(ValueError):
     """Carries the client-facing message for a bad lat/lon/radius."""
 
 
+def _to_float(raw):
+    """float() for a value that came from either a query string (always a
+    str) or a JSON body (any JSON type). JSON can carry a list, an object or
+    a boolean where a number belongs; float() raises TypeError on the first
+    two and happily turns True into 1.0 on the third. All three are the same
+    bad input, so all three raise ValueError and reach the same 400."""
+    if isinstance(raw, bool):
+        raise ValueError("boolean is not a number")
+    try:
+        return float(raw)
+    except TypeError:
+        raise ValueError("not a number")
+
+
 def _parse_radius_km(args):
     """Flask's request.args.get(..., type=float) silently falls back to the
     default on a parse failure instead of erroring -- a malformed radius
@@ -874,7 +888,7 @@ def _parse_radius_km(args):
     if raw is None:
         return 1.0
     try:
-        radius = float(raw)
+        radius = _to_float(raw)
     except ValueError:
         raise _InvalidSearchArgs("radius must be a number")
     if not math.isfinite(radius):
@@ -893,14 +907,20 @@ def _parse_search_origin(args):
     The finite/range checks are new. math.sin() raises on infinity, so a lat
     of "inf" reached haversine_distance_km and came back a 500 rather than
     the 400 it is; "nan" silently matched nothing at all.
+
+    `args` is any mapping with .get(): request.args for a GET, the JSON body
+    for a POST (see _search_args). The "query params" wording in the first
+    message is kept as-is on purpose -- candy-app matches on status codes,
+    not message text, and a POST caller sees the same message a GET caller
+    always has.
     """
     raw_lat = args.get("lat")
     raw_lon = args.get("lon")
     if raw_lat is None or raw_lon is None:
         raise _InvalidSearchArgs("lat and lon query params are required")
     try:
-        lat = float(raw_lat)
-        lon = float(raw_lon)
+        lat = _to_float(raw_lat)
+        lon = _to_float(raw_lon)
     except ValueError:
         raise _InvalidSearchArgs("lat and lon must be numbers")
     if not math.isfinite(lat) or not math.isfinite(lon):
@@ -910,11 +930,34 @@ def _parse_search_origin(args):
     return lat, lon
 
 
-@app.route("/nearby-stops", methods=["GET"])
+def _search_args():
+    """Where this request's lat/lon/radius live.
+
+    GET: the query string, exactly as before. POST: the JSON body. The body
+    is the whole point of accepting POST on the two search routes -- the
+    gunicorn access line in Render's app log records the request path WITH
+    its query string, so every GET search put the caller's coordinates into
+    a log that is kept for days. A request body is never part of that line.
+
+    Anything that is not a JSON object -- no body, a non-JSON content type,
+    a JSON list -- reads as an empty mapping, so the parsers produce the
+    same 400 a bare GET produces. One view function serves both methods on
+    purpose: request.endpoint is then identical for GET and POST, and the
+    rate limiter, which keys on the endpoint name, counts them against one
+    shared hourly allowance with no second entry in _RATE_LIMITS.
+    """
+    if request.method == "POST":
+        data = request.get_json(silent=True)
+        return data if isinstance(data, dict) else {}
+    return request.args
+
+
+@app.route("/nearby-stops", methods=["GET", "POST"])
 def nearby_stops():
+    args = _search_args()
     try:
-        lat, lon = _parse_search_origin(request.args)
-        radius = _parse_radius_km(request.args)
+        lat, lon = _parse_search_origin(args)
+        radius = _parse_radius_km(args)
     except _InvalidSearchArgs as error:
         return jsonify({"error": str(error)}), 400
 
@@ -1101,9 +1144,8 @@ def upload_greeting(stop_id):
     return jsonify(stop.to_dict())
 
 
-@app.route("/my-stops/<device_id>", methods=["GET"])
-def my_stops(device_id):
-    """The owner's own listings.
+def _my_stops_payload(device_id):
+    """The owner's own listings, as the list both /my-stops routes return.
 
     Each to_dict() used to call is_verified(), which issues its own COUNT --
     N+1 queries for a list of N stops, same shape as the one removed from
@@ -1118,7 +1160,7 @@ def my_stops(device_id):
     """
     stops = Stop.query.filter_by(registrant_device_id=device_id).all()
     if not stops:
-        return jsonify([])
+        return []
 
     tolerance = VERIFICATION_TOLERANCE_DEGREES
     clauses = [
@@ -1131,7 +1173,42 @@ def my_stops(device_id):
     universe = Stop.query.filter(db.or_(*clauses)).all()
     verified_ids = _verified_stop_ids(stops, universe)
 
-    return jsonify([stop.to_dict(verified=stop.id in verified_ids) for stop in stops])
+    return [stop.to_dict(verified=stop.id in verified_ids) for stop in stops]
+
+
+@app.route("/my-stops/<device_id>", methods=["GET"])
+def my_stops(device_id):
+    """Kept exactly as it was for the installed dev build. The path form
+    puts the device id into the gunicorn access line (see _search_args);
+    new clients use POST /my-stops below."""
+    return jsonify(_my_stops_payload(device_id))
+
+
+@app.route("/my-stops", methods=["POST"])
+def my_stops_lookup():
+    """Same list as GET /my-stops/<device_id>, with the id in the JSON body.
+
+    A body rather than a header, because every other route in this file
+    that needs the device id already takes it from the JSON body, so the
+    client has one way of sending it; and because a read keyed on a header
+    invites an intermediary to cache one device's answer for the next one
+    unless every hop honours Vary, while a POST is never cached.
+
+    Validation matches /register-stop, where the id was stored: a non-empty
+    string. The id is NOT stripped before the lookup, so the same string
+    gives the same answer on both routes. Unknown ids return [] here as
+    they do on GET -- there is nothing to learn from a 404.
+
+    Deliberately not in _RATE_LIMITS: the GET form has no entry either, the
+    work per call is the same, and a limit on only one of the two forms
+    would be no limit at all. If flood protection is ever wanted here it
+    goes on both forms in one change.
+    """
+    data = request.get_json(silent=True)
+    device_id = data.get("device_id") if isinstance(data, dict) else None
+    if not isinstance(device_id, str) or not device_id.strip():
+        return jsonify({"error": "device_id is required"}), 400
+    return jsonify(_my_stops_payload(device_id))
 
 
 @app.route("/update-stop/<int:stop_id>", methods=["PATCH"])
@@ -1517,11 +1594,15 @@ def register_business():
     return jsonify(business.to_dict(include_contact=True)), 201
 
 
-@app.route("/nearby-businesses", methods=["GET"])
+@app.route("/nearby-businesses", methods=["GET", "POST"])
 def nearby_businesses():
+    # POST accepted for the same reason as /nearby-stops (see _search_args):
+    # candy-app fires both searches from one Find press, so leaving this one
+    # GET-only would keep the coordinates in the access log anyway.
+    args = _search_args()
     try:
-        lat, lon = _parse_search_origin(request.args)
-        radius = _parse_radius_km(request.args)
+        lat, lon = _parse_search_origin(args)
+        radius = _parse_radius_km(args)
     except _InvalidSearchArgs as error:
         return jsonify({"error": str(error)}), 400
 
