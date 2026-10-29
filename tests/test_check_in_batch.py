@@ -1,4 +1,8 @@
-from datetime import date, datetime, timedelta, timezone
+"""No wall clock in this file. Every timestamp a test sends, and every
+calendar day it expects the server to file a check-in under, comes from the
+`frozen_clock` fixture in conftest.py, which also pins app.py's date.today().
+That fixture runs each test at two instants, one before and one after the
+20:00 US-Eastern rollover where the UTC day and the Eastern day diverge."""
 
 from app import CheckIn, Stop, db
 
@@ -27,26 +31,26 @@ def _make_verified_stop(client, device_id="registrant-1", lat=42.0, lon=-71.0, n
     return db.session.get(Stop, original_id)
 
 
-def _iso(dt):
-    return dt.isoformat()
-
-
-def test_batch_accepts_multiple_valid_checkins(client):
+def test_batch_accepts_multiple_valid_checkins(client, frozen_clock):
     stop_a = _make_verified_stop(client, lat=42.0, lon=-71.0, name="House A")
     stop_b = _make_verified_stop(client, lat=43.0, lon=-72.0, name="House B")
-    now = datetime.now(timezone.utc)
 
     response = client.post(
         "/check-in/batch",
         json={
             "device_id": "offline-device",
             "checkins": [
-                {"stop_id": stop_a.id, "latitude": stop_a.latitude, "longitude": stop_a.longitude, "checked_in_at": _iso(now)},
+                {
+                    "stop_id": stop_a.id,
+                    "latitude": stop_a.latitude,
+                    "longitude": stop_a.longitude,
+                    "checked_in_at": frozen_clock.iso(),
+                },
                 {
                     "stop_id": stop_b.id,
                     "latitude": stop_b.latitude,
                     "longitude": stop_b.longitude,
-                    "checked_in_at": _iso(now + timedelta(minutes=5)),
+                    "checked_in_at": frozen_clock.iso(minutes=5),
                 },
             ],
         },
@@ -61,21 +65,25 @@ def test_batch_accepts_multiple_valid_checkins(client):
     assert CheckIn.query.filter_by(device_id="offline-device").count() == 2
 
 
-def test_batch_rejects_duplicate_stop_id_within_same_batch(client):
+def test_batch_rejects_duplicate_stop_id_within_same_batch(client, frozen_clock):
     stop = _make_verified_stop(client)
-    now = datetime.now(timezone.utc)
 
     response = client.post(
         "/check-in/batch",
         json={
             "device_id": "offline-device",
             "checkins": [
-                {"stop_id": stop.id, "latitude": stop.latitude, "longitude": stop.longitude, "checked_in_at": _iso(now)},
                 {
                     "stop_id": stop.id,
                     "latitude": stop.latitude,
                     "longitude": stop.longitude,
-                    "checked_in_at": _iso(now + timedelta(minutes=1)),
+                    "checked_in_at": frozen_clock.iso(),
+                },
+                {
+                    "stop_id": stop.id,
+                    "latitude": stop.latitude,
+                    "longitude": stop.longitude,
+                    "checked_in_at": frozen_clock.iso(minutes=1),
                 },
             ],
         },
@@ -85,22 +93,26 @@ def test_batch_rejects_duplicate_stop_id_within_same_batch(client):
     assert CheckIn.query.filter_by(device_id="offline-device").count() == 0
 
 
-def test_batch_rejects_non_chronological_order(client):
+def test_batch_rejects_non_chronological_order(client, frozen_clock):
     stop_a = _make_verified_stop(client, lat=42.0, lon=-71.0, name="House A")
     stop_b = _make_verified_stop(client, lat=43.0, lon=-72.0, name="House B")
-    now = datetime.now(timezone.utc)
 
     response = client.post(
         "/check-in/batch",
         json={
             "device_id": "offline-device",
             "checkins": [
-                {"stop_id": stop_a.id, "latitude": stop_a.latitude, "longitude": stop_a.longitude, "checked_in_at": _iso(now)},
+                {
+                    "stop_id": stop_a.id,
+                    "latitude": stop_a.latitude,
+                    "longitude": stop_a.longitude,
+                    "checked_in_at": frozen_clock.iso(),
+                },
                 {
                     "stop_id": stop_b.id,
                     "latitude": stop_b.latitude,
                     "longitude": stop_b.longitude,
-                    "checked_in_at": _iso(now - timedelta(minutes=5)),
+                    "checked_in_at": frozen_clock.iso(minutes=-5),
                 },
             ],
         },
@@ -110,9 +122,8 @@ def test_batch_rejects_non_chronological_order(client):
     assert CheckIn.query.filter_by(device_id="offline-device").count() == 0
 
 
-def test_batch_rejects_more_than_max_items(client):
+def test_batch_rejects_more_than_max_items(client, frozen_clock):
     stop = _make_verified_stop(client)
-    now = datetime.now(timezone.utc)
     # One over the cap -- every item shares the SAME stop_id, which would
     # also trip the duplicate check, but the size cap should reject first
     # since it's the more fundamental "is this even a sane request" bound.
@@ -121,7 +132,7 @@ def test_batch_rejects_more_than_max_items(client):
             "stop_id": stop.id + i,  # distinct ids -- isolates the size check from the duplicate check
             "latitude": stop.latitude,
             "longitude": stop.longitude,
-            "checked_in_at": _iso(now + timedelta(minutes=i)),
+            "checked_in_at": frozen_clock.iso(minutes=i),
         }
         for i in range(51)
     ]
@@ -143,10 +154,15 @@ def test_batch_rejects_missing_device_id(client):
     assert response.status_code == 400
 
 
-def test_batch_is_a_no_op_for_a_checkin_already_recorded_live(client):
+def test_batch_is_a_no_op_for_a_checkin_already_recorded_live(client, frozen_clock):
     """The exact scenario the plan called out: a check-in that already
     succeeded via the real-time path shouldn't be double-counted just
-    because a stale offline queue still has it too."""
+    because a stale offline queue still has it too.
+
+    The live path files the row under the server's date.today(); the batch
+    path files it under checked_in_at.date(). With both clocks frozen to the
+    same instant the two dates agree on either side of the Eastern 20:00
+    rollover, which is the property this test exists to pin."""
     stop = _make_verified_stop(client)
 
     live = client.post(
@@ -165,7 +181,7 @@ def test_batch_is_a_no_op_for_a_checkin_already_recorded_live(client):
                     "stop_id": stop.id,
                     "latitude": stop.latitude,
                     "longitude": stop.longitude,
-                    "checked_in_at": _iso(datetime.now(timezone.utc)),
+                    "checked_in_at": frozen_clock.iso(),
                 }
             ],
         },
@@ -182,7 +198,7 @@ def test_batch_is_a_no_op_for_a_checkin_already_recorded_live(client):
     assert household.points == 5  # unchanged -- not re-awarded
 
 
-def test_batch_is_a_no_op_when_the_same_item_is_resynced_in_a_later_batch(client):
+def test_batch_is_a_no_op_when_the_same_item_is_resynced_in_a_later_batch(client, frozen_clock):
     """Simulates a partial-sync retry: the same queued item gets submitted
     in two separate batch calls (e.g. the first sync succeeded server-side
     but the client never got the response before losing connection
@@ -195,7 +211,7 @@ def test_batch_is_a_no_op_when_the_same_item_is_resynced_in_a_later_batch(client
                 "stop_id": stop.id,
                 "latitude": stop.latitude,
                 "longitude": stop.longitude,
-                "checked_in_at": _iso(datetime.now(timezone.utc)),
+                "checked_in_at": frozen_clock.iso(),
             }
         ],
     }
@@ -213,7 +229,7 @@ def test_batch_is_a_no_op_when_the_same_item_is_resynced_in_a_later_batch(client
     assert household.points == 5
 
 
-def test_batch_reports_stop_unavailable_distinctly_from_stop_not_found(client):
+def test_batch_reports_stop_unavailable_distinctly_from_stop_not_found(client, frozen_clock):
     """A stop hidden by reports between the offline tap and the eventual sync
     should report a DIFFERENT reason than a stop that genuinely never existed,
     so the client can say something specific rather than a generic error.
@@ -234,7 +250,7 @@ def test_batch_reports_stop_unavailable_distinctly_from_stop_not_found(client):
                     "stop_id": stop.id,
                     "latitude": stop.latitude,
                     "longitude": stop.longitude,
-                    "checked_in_at": _iso(datetime.now(timezone.utc)),
+                    "checked_in_at": frozen_clock.iso(),
                 },
             ],
         },
@@ -254,7 +270,7 @@ def test_batch_reports_stop_unavailable_distinctly_from_stop_not_found(client):
                     "stop_id": stop.id + 99999,
                     "latitude": stop.latitude,
                     "longitude": stop.longitude,
-                    "checked_in_at": _iso(datetime.now(timezone.utc)),
+                    "checked_in_at": frozen_clock.iso(),
                 },
             ],
         },
@@ -264,7 +280,7 @@ def test_batch_reports_stop_unavailable_distinctly_from_stop_not_found(client):
     assert nonexistent_result["reason"] != result["reason"]
 
 
-def test_batch_accepts_a_queued_check_in_at_a_stop_that_ran_out_later(client):
+def test_batch_accepts_a_queued_check_in_at_a_stop_that_ran_out_later(client, frozen_clock):
     """The offline case this change exists for: a kid taps check-in at a house
     that still has candy, goes out of signal, and the house runs out before the
     queue syncs. That check-in must still be credited -- the visit really
@@ -283,7 +299,7 @@ def test_batch_accepts_a_queued_check_in_at_a_stop_that_ran_out_later(client):
                     "stop_id": stop.id,
                     "latitude": stop.latitude,
                     "longitude": stop.longitude,
-                    "checked_in_at": _iso(datetime.now(timezone.utc)),
+                    "checked_in_at": frozen_clock.iso(),
                 },
             ],
         },
@@ -299,19 +315,29 @@ def test_batch_accepts_a_queued_check_in_at_a_stop_that_ran_out_later(client):
     assert household.points == 5
 
 
-def test_batch_records_checkin_under_the_captured_date_not_todays_date(client):
+def test_batch_records_checkin_under_the_captured_date_not_todays_date(client, frozen_clock):
     """A check-in captured just before midnight and synced after it should
     still count for the night it actually happened, not the day it
-    happened to reach the server."""
+    happened to reach the server.
+
+    "Yesterday" is one day before the frozen instant, so its UTC calendar
+    day is one before the server's frozen today by construction -- the
+    comparison no longer depends on the wall clock of the machine running
+    the suite."""
     stop = _make_verified_stop(client)
-    yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+    yesterday = frozen_clock.utc(days=-1)
 
     response = client.post(
         "/check-in/batch",
         json={
             "device_id": "offline-device",
             "checkins": [
-                {"stop_id": stop.id, "latitude": stop.latitude, "longitude": stop.longitude, "checked_in_at": _iso(yesterday)},
+                {
+                    "stop_id": stop.id,
+                    "latitude": stop.latitude,
+                    "longitude": stop.longitude,
+                    "checked_in_at": yesterday.isoformat(),
+                },
             ],
         },
     )
@@ -321,4 +347,4 @@ def test_batch_records_checkin_under_the_captured_date_not_todays_date(client):
 
     recorded = CheckIn.query.filter_by(device_id="offline-device", stop_id=stop.id).first()
     assert recorded.check_in_date == yesterday.date()
-    assert recorded.check_in_date != date.today()
+    assert recorded.check_in_date != frozen_clock.today

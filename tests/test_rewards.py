@@ -1,10 +1,11 @@
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 
 from app import REWARDS_CATALOG, TRIVIA_QUESTIONS, Household, Redemption, Stop, db
 
 
-def _todays_question():
-    today = date.today()
+def _question_for(today):
+    """Mirrors /trivia/today's selection rule for the frozen server day, so
+    the test and the route cannot disagree about which question is on."""
     return TRIVIA_QUESTIONS[today.toordinal() % len(TRIVIA_QUESTIONS)]
 
 
@@ -148,8 +149,8 @@ def test_verification_bonus_awarded_once_to_original_registrant(client):
 # ── Trivia ────────────────────────────────────────────────────────────────
 
 
-def test_trivia_correct_answer_awards_points_once(client):
-    question = _todays_question()
+def test_trivia_correct_answer_awards_points_once(client, frozen_today):
+    question = _question_for(frozen_today)
 
     response = client.post(
         "/trivia/answer",
@@ -161,8 +162,8 @@ def test_trivia_correct_answer_awards_points_once(client):
     assert body == {"correct": True, "points_awarded": 10, "points_total": 10}
 
 
-def test_trivia_incorrect_answer_awards_no_points(client):
-    question = _todays_question()
+def test_trivia_incorrect_answer_awards_no_points(client, frozen_today):
+    question = _question_for(frozen_today)
     wrong_index = (question["correct_index"] + 1) % len(question["choices"])
 
     response = client.post(
@@ -175,8 +176,8 @@ def test_trivia_incorrect_answer_awards_no_points(client):
     assert body == {"correct": False, "points_awarded": 0, "points_total": 0}
 
 
-def test_trivia_second_answer_same_day_rejected(client):
-    question = _todays_question()
+def test_trivia_second_answer_same_day_rejected(client, frozen_today):
+    question = _question_for(frozen_today)
     payload = {"device_id": "trivia-1", "answer": question["correct_index"]}
 
     first = client.post("/trivia/answer", json=payload)

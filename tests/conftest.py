@@ -35,9 +35,89 @@ os.environ.setdefault("R2_PUBLIC_BASE_URL", "https://pub-test.r2.dev")
 # test value keeps mint's output reproducible across test runs.
 os.environ.setdefault("LEGEND_CODE_PEPPER", "test-pepper-do-not-use-in-prod")
 
+from datetime import date, datetime, timedelta, timezone  # noqa: E402
+
 import pytest  # noqa: E402
 
+import app as app_module  # noqa: E402
 from app import _run_lightweight_migrations, app as flask_app, db  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Frozen clock
+#
+# app.py reads the calendar through the module global `date` (date.today() in
+# /check-in, /night-ledger, /trivia/*, and the retention purge) and the batch
+# route takes each item's date from its own checked_in_at timestamp. Two tests
+# used to mix a UTC timestamp from the test with date.today() from the server:
+# after 20:00 US-Eastern the UTC calendar day is already tomorrow, so the two
+# dates disagreed and the suite went red for four hours every evening.
+#
+# The fixtures below pin BOTH clocks to one chosen instant so the result no
+# longer depends on when the suite runs. The server's "today" is modelled as
+# the UTC calendar day of that instant, which is what date.today() returns on
+# a server whose process timezone is UTC. Both instants fall on Halloween
+# night 2026, one on each side of the 20:00 Eastern rollover, so the case that
+# used to fail by luck is now exercised on purpose every run.
+#
+# Note on mechanism: datetime.date is a C type and its `today` cannot be
+# patched in place, so the fixture swaps app.py's module-level name `date` for
+# a subclass whose today() answers with the frozen day. Nothing in app.py
+# calls date(...) directly, and today() hands back a plain datetime.date, so
+# everything downstream (SQLAlchemy Date columns, isoformat, toordinal) sees
+# the same type it always did.
+# ---------------------------------------------------------------------------
+
+FROZEN_INSTANTS = {
+    # 18:30 EDT on 2026-10-31 -- the UTC day and the Eastern day agree.
+    "before-8pm-eastern": datetime(2026, 10, 31, 22, 30, tzinfo=timezone.utc),
+    # 21:30 EDT on 2026-10-31 -- the UTC day has already rolled to 11-01.
+    "after-8pm-eastern": datetime(2026, 11, 1, 1, 30, tzinfo=timezone.utc),
+}
+
+
+class FrozenClock:
+    """What a test may know about time: the instant, and the server's day."""
+
+    def __init__(self, now_utc):
+        self.now_utc = now_utc
+        self.today = now_utc.date()
+
+    def utc(self, **delta):
+        """The frozen instant shifted by a timedelta, still timezone-aware."""
+        return self.now_utc + timedelta(**delta)
+
+    def iso(self, **delta):
+        """The shifted instant as the ISO-8601 string a client would send."""
+        return self.utc(**delta).isoformat()
+
+
+def _freeze_clock(monkeypatch, now_utc):
+    frozen_today = now_utc.date()
+
+    class _FrozenDate(date):
+        @classmethod
+        def today(cls):
+            return frozen_today
+
+    monkeypatch.setattr(app_module, "date", _FrozenDate)
+    return FrozenClock(now_utc)
+
+
+@pytest.fixture(params=list(FROZEN_INSTANTS.values()), ids=list(FROZEN_INSTANTS))
+def frozen_clock(request, monkeypatch):
+    """Runs the test twice, once per instant in FROZEN_INSTANTS. Use it in
+    any test that sends a timestamp to the server AND cares what calendar
+    day the server files it under."""
+    return _freeze_clock(monkeypatch, request.param)
+
+
+@pytest.fixture
+def frozen_today(monkeypatch):
+    """A single frozen server day (the after-8pm instant, the one that used
+    to bite), for tests that only read date.today() through the app and
+    would otherwise straddle midnight by accident."""
+    return _freeze_clock(monkeypatch, FROZEN_INSTANTS["after-8pm-eastern"]).today
 
 
 @pytest.fixture(autouse=True)

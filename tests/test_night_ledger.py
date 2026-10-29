@@ -1,4 +1,11 @@
-from datetime import date, timedelta
+"""Every test here reads "today" through the app (date.today() in /check-in
+and /night-ledger). The `frozen_today` fixture from conftest.py pins that day
+so a run that straddles midnight cannot file a check-in under one date and
+read the ledger for another."""
+
+from datetime import timedelta
+
+import pytest
 
 from app import CheckIn, Household, Stop, db
 
@@ -42,13 +49,13 @@ def _check_in(client, device_id, stop):
     )
 
 
-def test_night_ledger_no_checkins_returns_zeros(client):
+def test_night_ledger_no_checkins_returns_zeros(client, frozen_today):
     response = client.get("/night-ledger/never-checked-in")
 
     assert response.status_code == 200
     assert response.get_json() == {
         "device_id": "never-checked-in",
-        "date": date.today().isoformat(),
+        "date": frozen_today.isoformat(),
         "total_checkins": 0,
         "verified_stops_checked_in": 0,
         "greetings_encountered": 0,
@@ -57,6 +64,7 @@ def test_night_ledger_no_checkins_returns_zeros(client):
     }
 
 
+@pytest.mark.usefixtures("frozen_today")
 def test_night_ledger_counts_todays_checkins(client):
     stop_a = _make_verified_stop(client, device_id="reg-a", lat=42.0, lon=-71.0, name="House A")
     stop_b = _make_verified_stop(client, device_id="reg-b", lat=43.0, lon=-71.0, name="House B")
@@ -74,6 +82,7 @@ def test_night_ledger_counts_todays_checkins(client):
     assert body["verified_stops_checked_in"] == 2
 
 
+@pytest.mark.usefixtures("frozen_today")
 def test_night_ledger_does_not_report_candy_available_count(client):
     """The stat is gone. A stop that has run out must not change the recap --
     a child's ledger should never shrink because a house emptied later."""
@@ -89,6 +98,7 @@ def test_night_ledger_does_not_report_candy_available_count(client):
     assert body["total_checkins"] == 1
 
 
+@pytest.mark.usefixtures("frozen_today")
 def test_night_ledger_locked_household_shows_zero_heard(client):
     stop = _make_verified_stop(client, lat=42.0, lon=-71.0)
     stop.greeting_audio_url = "https://example.com/greeting.m4a"
@@ -105,6 +115,7 @@ def test_night_ledger_locked_household_shows_zero_heard(client):
     assert body["greetings_heard"] == 0
 
 
+@pytest.mark.usefixtures("frozen_today")
 def test_night_ledger_unlocked_household_shows_all_heard(client):
     stop_a = _make_verified_stop(client, device_id="reg-a", lat=42.0, lon=-71.0, name="House A")
     stop_a.greeting_audio_url = "https://example.com/a.m4a"
@@ -128,6 +139,7 @@ def test_night_ledger_unlocked_household_shows_all_heard(client):
     assert body["greetings_heard"] == 2
 
 
+@pytest.mark.usefixtures("frozen_today")
 def test_night_ledger_ignores_stops_without_greetings(client):
     stop = _make_verified_stop(client, lat=42.0, lon=-71.0)
     assert stop.greeting_audio_url is None
@@ -145,11 +157,11 @@ def test_night_ledger_ignores_stops_without_greetings(client):
     assert body["greetings_heard"] == 0
 
 
-def test_night_ledger_excludes_checkins_from_a_previous_day(client):
+def test_night_ledger_excludes_checkins_from_a_previous_day(client, frozen_today):
     stop = _make_verified_stop(client, lat=42.0, lon=-71.0)
 
     db.session.add(
-        CheckIn(device_id="walker-5", stop_id=stop.id, check_in_date=date.today() - timedelta(days=1))
+        CheckIn(device_id="walker-5", stop_id=stop.id, check_in_date=frozen_today - timedelta(days=1))
     )
     db.session.commit()
 

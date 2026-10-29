@@ -121,19 +121,19 @@ def test_registered_stop_always_has_an_owner(client):
 # 5. CheckIn retention
 # --------------------------------------------------------------------------
 
-def test_expired_check_ins_are_purged_on_the_next_write(client):
-    from datetime import date, timedelta
+def test_expired_check_ins_are_purged_on_the_next_write(client, frozen_today):
+    from datetime import timedelta
 
     with app_module.app.app_context():
         stale = app_module.CheckIn(
             device_id="ancient-device",
             stop_id=1,
-            check_in_date=date.today() - timedelta(days=app_module.CHECKIN_RETENTION_DAYS + 5),
+            check_in_date=frozen_today - timedelta(days=app_module.CHECKIN_RETENTION_DAYS + 5),
         )
         fresh = app_module.CheckIn(
             device_id="recent-device",
             stop_id=1,
-            check_in_date=date.today() - timedelta(days=1),
+            check_in_date=frozen_today - timedelta(days=1),
         )
         app_module.db.session.add_all([stale, fresh])
         app_module.db.session.commit()
@@ -147,7 +147,7 @@ def test_expired_check_ins_are_purged_on_the_next_write(client):
         assert remaining[0].device_id == "recent-device"
 
 
-def test_a_failing_purge_does_not_discard_the_check_in(client, monkeypatch):
+def test_a_failing_purge_does_not_discard_the_check_in(client, monkeypatch, frozen_today):
     """A failure in retention must never cost a child their check-in.
 
     The purge runs inside the CALLER'S transaction, after the CheckIn row,
@@ -167,8 +167,6 @@ def test_a_failing_purge_does_not_discard_the_check_in(client, monkeypatch):
     because the bug only exists in relation to the transaction the purge is
     borrowing -- in isolation there is nothing to lose.
     """
-    from datetime import date
-
     import sqlalchemy.orm
 
     owner = "purge-owner"
@@ -194,7 +192,7 @@ def test_a_failing_purge_does_not_discard_the_check_in(client, monkeypatch):
         monkeypatch.setattr(sqlalchemy.orm.Query, "delete", _failing_delete)
 
         result = app_module._apply_check_in(
-            "trick-or-treater", stop_id, 28.7700, -81.3400, date.today()
+            "trick-or-treater", stop_id, 28.7700, -81.3400, frozen_today
         )
 
         assert result["status"] == "accepted"
