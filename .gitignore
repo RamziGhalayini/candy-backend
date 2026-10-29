@@ -40,3 +40,16 @@ server.err.log
 
 # Claude Code local settings (machine-specific, not for the team)
 .claude/settings.local.json
+
+# Database dumps and exports (added 2026-10-29). The .db rules above cover
+# the local SQLite files, but nothing matched a Postgres dump or export:
+# pg_dump plain output is .sql, custom-format output is commonly named
+# .dump / .pgdump / .backup, and gzip-compressed plain dumps are .sql.gz.
+# A dump of the Render database holds real rows and device ids, and this
+# repo is public. No tracked .sql file existed when these were added
+# (no migrations or seed scripts live here), so *.sql is safe to ignore.
+*.sql
+*.sql.gz
+*.dump
+*.pgdump
+*.backup
