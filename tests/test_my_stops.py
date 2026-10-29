@@ -209,10 +209,12 @@ def test_my_stops_get_path_is_unchanged(client):
     assert client.post("/my-stops/owner-1").status_code == 405, "the path form is GET-only"
 
 
-def test_neither_my_stops_form_is_rate_limited(client):
-    """Neither form has an entry in _RATE_LIMITS; a limit on only one of
-    them would be no limit, and a limit on the GET form would change a route
-    the installed build calls. Fifty calls each from one address pass."""
+def test_both_my_stops_forms_sit_far_above_household_volume(client):
+    """Until 2026-10-29 neither form had an entry in _RATE_LIMITS (a limit on
+    only one of them would be no limit). Both now sit in the normal-use group
+    at 2000/hr, in one change -- tests/test_live_route_bounds.py pins the
+    number and the 429. What this test still pins: fifty calls each from one
+    address, the most a household plausibly makes, pass on both forms."""
     headers = {"X-Forwarded-For": "203.0.113.50"}
     for _ in range(50):
         assert client.get("/my-stops/owner-1", headers=headers).status_code == 200

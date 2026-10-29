@@ -220,6 +220,11 @@ def test_injected_device_id_in_a_body_is_a_bound_parameter(client, seeded, execu
 
 
 def test_injected_names_and_device_ids_are_stored_as_literal_text(client, seeded):
+    """Until 2026-10-29 this also sent the payload as `type` and expected it
+    stored; /register-stop now accepts only 'house' or 'business' there
+    (tests/test_live_route_bounds.py), so an injected type gets the 400 any
+    other wrong value gets -- checked at the end -- and the name and device
+    id still land as literal text."""
     before = _snapshot()
 
     for index, payload in enumerate(INJECTIONS):
@@ -227,7 +232,7 @@ def test_injected_names_and_device_ids_are_stored_as_literal_text(client, seeded
             "/register-stop",
             json={
                 "name": payload,
-                "type": payload,
+                "type": "house",
                 "latitude": 10.0 + index,
                 "longitude": 10.0,
                 "device_id": payload,
@@ -235,7 +240,7 @@ def test_injected_names_and_device_ids_are_stored_as_literal_text(client, seeded
         )
         assert created.status_code == 201, payload
         assert created.get_json()["name"] == payload
-        assert created.get_json()["type"] == payload
+        assert created.get_json()["type"] == "house"
 
         mine = client.post("/my-stops", json={"device_id": payload}).get_json()
         assert [s["name"] for s in mine] == [payload], payload
@@ -263,6 +268,15 @@ def test_injected_names_and_device_ids_are_stored_as_literal_text(client, seeded
     expected["business"] += len(INJECTIONS)
     assert after == expected
     assert db.session.execute(sa.select(sa.func.count()).select_from(Business.__table__)).scalar() == expected["business"]
+
+    for payload in INJECTIONS:
+        rejected = client.post(
+            "/register-stop",
+            json={"name": "Typed", "type": payload, "latitude": 20.0, "longitude": 20.0, "device_id": "typed"},
+        )
+        assert rejected.status_code == 400, payload
+        assert rejected.get_json() == {"error": "type must be house or business"}, payload
+    assert _snapshot() == after
 
 
 def test_injected_report_reason_counts_one_report_and_nothing_else(client, seeded):

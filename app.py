@@ -20,6 +20,7 @@ import os
 import secrets
 import threading
 import time
+import unicodedata
 import uuid
 from collections import deque
 from datetime import date, datetime, timedelta, timezone
@@ -713,6 +714,16 @@ _RATE_LIMITS = {
     # anything a real shared address produces
     "nearby_stops": (2000, 3600),
     "nearby_businesses": (2000, 3600),
+    # The owner's own list (both forms) and the owner's own edit joined this
+    # group on 2026-10-29 (JOB-09 audit F7). Before that they had no ceiling
+    # at all: /my-stops is two queries plus Python per call, and /update-stop
+    # answers 403 or 404 to anyone who guesses a stop id. One household cannot
+    # reach 2000 in an hour. The GET and POST forms of /my-stops are separate
+    # view functions, so the limiter keys them as two buckets of 2000 each --
+    # the same per-endpoint keying every other row here uses.
+    "my_stops": (2000, 3600),
+    "my_stops_lookup": (2000, 3600),
+    "update_stop": (2000, 3600),
     "check_in": (2000, 3600),
     "check_in_batch": (600, 3600),
     "redeem_reward": (600, 3600),
@@ -829,9 +840,106 @@ def _reject_nul_bytes(**fields):
     return None
 
 
+# ---------------------------------------------------------------------------
+# Payload bounds on the live stop routes (2026-10-29, from the JOB-09 audit:
+# F1, F2, F5, F6, F9, F11)
+#
+# Every bound below is a TECHNICAL ceiling -- the point past which the value
+# could only have come from a script, or past which the database would have
+# answered with a 500 -- and not a product limit. A product cap (how long a
+# porch name may be, how many pieces of candy a count may hold) is Ramzi's
+# call and is deliberately not taken here. Each check rejects only what no
+# build of candy-app sends: the app posts name.trim(), the literal type
+# 'house', a GPS fix, a UUID device id and a Number.isInteger count
+# (app/porch-setup.tsx:103-114, app/my-stops.tsx:159-166).
+# ---------------------------------------------------------------------------
+
+# The only two values the stop.type column has ever held: candy-app sends
+# 'house' (porch-setup.tsx:109) and documents 'business' as the value older
+# registrations stored (types/stop.ts:4-6).
+STOP_TYPES = frozenset({"house", "business"})
+
+# Counted in code points (Python len), so a family emoji counts 7 and a
+# combining sequence counts each mark. 1,000 is far beyond any map label
+# the single-line name field could hold; it is a payload bound, chosen so a
+# 3 MiB name can no longer be echoed into every /nearby-stops response.
+MAX_STOP_NAME_CODEPOINTS = 1000
+
+# /report-stop's reason is parsed and discarded (see the route); the cap only
+# bounds the work a caller can make the parser do.
+MAX_REPORT_REASON_CODEPOINTS = 2000
+
+# Postgres INTEGER is 32-bit signed. Above this the driver fails the INSERT
+# with "integer out of range" and the route answered 500; SQLite, which the
+# suite runs on, would have stored it. No product cap on the count.
+MAX_CANDY_COUNT = 2_147_483_647
+
+# Control characters that stay allowed in a name: a pasted value can carry a
+# tab or a line break, and neither does anything a renderer cannot show.
+_ALLOWED_CONTROL_CHARACTERS = frozenset("\t\n\r")
+
+# Unicode bidirectional overrides and isolates (U+202A-U+202E, U+2066-U+2069):
+# invisible, and they reverse how the surrounding text is drawn, so a name
+# can be made to read differently from what is stored.
+_BIDI_CONTROL_CHARACTERS = frozenset("‪‫‬‭‮⁦⁧⁨⁩")
+
+
+def _has_unsupported_characters(value):
+    """True when a name carries a C0/C1 control character other than tab,
+    newline or carriage return, or a bidi override/isolate. Unicode category
+    Cc is exactly U+0000-U+001F, U+007F and U+0080-U+009F. NUL is in that
+    set too, but _reject_nul_bytes runs first on every route so a NUL keeps
+    its own, older message."""
+    for character in value:
+        if character in _BIDI_CONTROL_CHARACTERS:
+            return True
+        if character in _ALLOWED_CONTROL_CHARACTERS:
+            continue
+        if unicodedata.category(character) == "Cc":
+            return True
+    return False
+
+
+def _coordinate_error(lat, lon, lat_name="lat", lon_name="lon"):
+    """The finite-and-range rule both search routes have applied since the
+    radius hardening, now shared with /register-stop. Returns the client
+    message, or None when the pair is a real place. The two messages are
+    byte-for-byte what _parse_search_origin always produced for its field
+    names; /register-stop passes its own field names so its messages match
+    the ones it already uses for the same fields.
+
+    Python's float() accepts "nan", "inf" and "1e400" (which overflows to
+    inf), and Flask's JSON loader is plain json.loads, which accepts the
+    bare tokens NaN and Infinity -- so every one of those reached the
+    database on /register-stop. math.floor(nan) raises ValueError and
+    math.floor(inf) raises OverflowError, and _verified_stop_ids calls
+    math.floor on every stop's latitude, so one such row turned the owner's
+    own /my-stops, and any search that fell back to a full scan, into a 500.
+    """
+    if not math.isfinite(lat) or not math.isfinite(lon):
+        return f"{lat_name} and {lon_name} must be numbers"
+    if not -90.0 <= lat <= 90.0 or not -180.0 <= lon <= 180.0:
+        return f"{lat_name} must be between -90 and 90, {lon_name} between -180 and 180"
+    return None
+
+
+def _json_object_body():
+    """The request's JSON body when it is a JSON object, else {}.
+
+    Same guard _search_args and /my-stops already use. get_json(silent=True)
+    returns None for no body, a non-JSON content type or malformed JSON, and
+    the old `or {}` handled that -- but a JSON list, string, number or `true`
+    is a truthy non-dict, so `data.get(...)` raised AttributeError and the
+    route answered 500. Reading those as {} gives them the same "required"
+    400 a missing body gets.
+    """
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else {}
+
+
 @app.route("/register-stop", methods=["POST"])
 def register_stop():
-    data = request.get_json(silent=True) or {}
+    data = _json_object_body()
 
     name = data.get("name")
     stop_type = data.get("type")
@@ -842,6 +950,11 @@ def register_stop():
 
     if name is None or stop_type is None or latitude is None or longitude is None:
         return jsonify({"error": "name, type, latitude, and longitude are required"}), 400
+
+    # A dict or list here fails inside the driver (500); an int or bool is
+    # stored through Postgres's assignment cast. Neither is a name.
+    if not isinstance(name, str) or not isinstance(stop_type, str):
+        return jsonify({"error": "name and type must be strings"}), 400
 
     # device_id is REQUIRED here. It used to be optional, which meant a stop
     # could be created with registrant_device_id = None -- an ownerless
@@ -864,13 +977,32 @@ def register_stop():
     except (TypeError, ValueError):
         return jsonify({"error": "latitude and longitude must be numbers"}), 400
 
+    coordinate_error = _coordinate_error(latitude, longitude, "latitude", "longitude")
+    if coordinate_error is not None:
+        return jsonify({"error": coordinate_error}), 400
+
     if candy_count is not None:
         if isinstance(candy_count, bool) or not isinstance(candy_count, int) or candy_count < 0:
             return jsonify({"error": "candy_count must be a non-negative integer"}), 400
+        if candy_count > MAX_CANDY_COUNT:
+            return jsonify({"error": f"candy_count must be {MAX_CANDY_COUNT} or less"}), 400
 
     rejected = _reject_nul_bytes(name=name, type=stop_type, device_id=device_id)
     if rejected is not None:
         return rejected
+
+    # Stripped the way candy-app already strips it (porch-setup.tsx:108), so
+    # the stored value is what the app would have sent anyway.
+    name = name.strip()
+    if not name:
+        return jsonify({"error": "name must not be empty"}), 400
+    if len(name) > MAX_STOP_NAME_CODEPOINTS:
+        return jsonify({"error": f"name must be {MAX_STOP_NAME_CODEPOINTS} characters or fewer"}), 400
+    if _has_unsupported_characters(name):
+        return jsonify({"error": "name contains unsupported characters"}), 400
+
+    if stop_type not in STOP_TYPES:
+        return jsonify({"error": "type must be house or business"}), 400
 
     stop = Stop(
         name=name,
@@ -961,10 +1093,12 @@ def _parse_search_origin(args):
         lon = _to_float(raw_lon)
     except ValueError:
         raise _InvalidSearchArgs("lat and lon must be numbers")
-    if not math.isfinite(lat) or not math.isfinite(lon):
-        raise _InvalidSearchArgs("lat and lon must be numbers")
-    if not -90.0 <= lat <= 90.0 or not -180.0 <= lon <= 180.0:
-        raise _InvalidSearchArgs("lat must be between -90 and 90, lon between -180 and 180")
+    # The finite/range rule itself lives in _coordinate_error since
+    # 2026-10-29 so /register-stop applies the same one; the messages it
+    # returns for "lat"/"lon" are the ones this function always raised.
+    error = _coordinate_error(lat, lon)
+    if error is not None:
+        raise _InvalidSearchArgs(error)
     return lat, lon
 
 
@@ -1048,7 +1182,16 @@ def nearby_stops():
 
 @app.route("/report-stop/<int:stop_id>", methods=["POST"])
 def report_stop(stop_id):
-    data = request.get_json(silent=True) or {}
+    # Unlike /register-stop and /update-stop, this route has no required
+    # field, so "read a non-object body as {}" would not give a 400 here: it
+    # would COUNT a body of `[1]` or `"x"` as a report against the household.
+    # A missing body still reads as {} (the installed build may send one);
+    # a body that is JSON but not an object is refused instead of counted.
+    data = request.get_json(silent=True)
+    if data is None:
+        data = {}
+    elif not isinstance(data, dict):
+        return jsonify({"error": "request body must be a JSON object"}), 400
 
     reason = data.get("reason", "")
     if reason is None:
@@ -1058,6 +1201,9 @@ def report_stop(stop_id):
     rejected = _reject_nul_bytes(reason=reason)
     if rejected is not None:
         return rejected
+    # Still not stored or logged (see below); the cap bounds parser work only.
+    if len(reason) > MAX_REPORT_REASON_CODEPOINTS:
+        return jsonify({"error": f"reason must be {MAX_REPORT_REASON_CODEPOINTS} characters or fewer"}), 400
 
     stop = db.session.get(Stop, stop_id)
     if stop is None:
@@ -1242,19 +1388,20 @@ def my_stops_lookup():
     unless every hop honours Vary, while a POST is never cached.
 
     Validation matches /register-stop, where the id was stored: a non-empty
-    string. The id is NOT stripped before the lookup, so the same string
-    gives the same answer on both routes. Unknown ids return [] here as
-    they do on GET -- there is nothing to learn from a 404.
+    string, stripped the same way (since 2026-10-29; before that a padded id
+    registered stripped and then never matched its own stops). Unknown ids
+    return [] here as they do on GET -- there is nothing to learn from a
+    404. The GET form is untouched, including its unstripped lookup, for the
+    installed build.
 
-    Deliberately not in _RATE_LIMITS: the GET form has no entry either, the
-    work per call is the same, and a limit on only one of the two forms
-    would be no limit at all. If flood protection is ever wanted here it
-    goes on both forms in one change.
+    Both forms sit in _RATE_LIMITS' normal-use group (2000/hr) since
+    2026-10-29, in one change, as the note that used to be here asked.
     """
     data = request.get_json(silent=True)
     device_id = data.get("device_id") if isinstance(data, dict) else None
     if not isinstance(device_id, str) or not device_id.strip():
         return jsonify({"error": "device_id is required"}), 400
+    device_id = device_id.strip()
     rejected = _reject_nul_bytes(device_id=device_id)
     if rejected is not None:
         return rejected
@@ -1263,11 +1410,16 @@ def my_stops_lookup():
 
 @app.route("/update-stop/<int:stop_id>", methods=["PATCH"])
 def update_stop(stop_id):
-    data = request.get_json(silent=True) or {}
+    data = _json_object_body()
 
+    # Same rule and the same strip as /register-stop, where the id being
+    # compared against was stored (2026-10-29). A non-string id used to fall
+    # through to the ownership comparison and answer 403; it is a 400 now,
+    # as it already was on POST /my-stops.
     device_id = data.get("device_id")
-    if not device_id:
+    if not isinstance(device_id, str) or not device_id.strip():
         return jsonify({"error": "device_id is required"}), 400
+    device_id = device_id.strip()
     rejected = _reject_nul_bytes(device_id=device_id)
     if rejected is not None:
         return rejected
@@ -1284,6 +1436,8 @@ def update_stop(stop_id):
         if candy_count is not None:
             if isinstance(candy_count, bool) or not isinstance(candy_count, int) or candy_count < 0:
                 return jsonify({"error": "candy_count must be a non-negative integer"}), 400
+            if candy_count > MAX_CANDY_COUNT:
+                return jsonify({"error": f"candy_count must be {MAX_CANDY_COUNT} or less"}), 400
         stop.candy_count = candy_count
 
     if "candy_available" in data:
