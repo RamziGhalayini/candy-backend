@@ -795,6 +795,40 @@ def version():
     return jsonify({"commit": os.environ.get("RENDER_GIT_COMMIT") or None})
 
 
+# ---------------------------------------------------------------------------
+# NUL bytes in request strings
+#
+# Postgres text cannot hold U+0000, and psycopg2 refuses to send one: a str
+# with a NUL in it fails before the query leaves the process ("A string
+# literal cannot contain NUL (0x00) characters"), which SQLAlchemy raises as
+# a ValueError/DataError and Flask turns into a 500. SQLite, which the test
+# suite runs on, stores and compares the same string without complaint -- so
+# the 500 only ever showed up in production (found 2026-10-26).
+#
+# Nothing is executed as SQL either way; the payload is always a bound
+# parameter. This is purely about giving the two databases the same answer,
+# and a 400 is the right one: no real client produces a NUL in a name or an
+# id. Checked before the first query on every route where a caller-chosen
+# string reaches the database, and only on str values -- a non-string is
+# whatever bad-input answer the route already gave it.
+# ---------------------------------------------------------------------------
+
+
+def _contains_nul(value):
+    return isinstance(value, str) and "\x00" in value
+
+
+def _reject_nul_bytes(**fields):
+    """A 400 naming the first request string that contains a NUL byte, in the
+    same {"error": ...} shape every route here uses for bad input; None when
+    every given value is clean. Call as _reject_nul_bytes(name=name, ...) so
+    the field name in the message is the key the client actually sent."""
+    for field, value in fields.items():
+        if _contains_nul(value):
+            return jsonify({"error": f"{field} must not contain NUL characters"}), 400
+    return None
+
+
 @app.route("/register-stop", methods=["POST"])
 def register_stop():
     data = request.get_json(silent=True) or {}
@@ -833,6 +867,10 @@ def register_stop():
     if candy_count is not None:
         if isinstance(candy_count, bool) or not isinstance(candy_count, int) or candy_count < 0:
             return jsonify({"error": "candy_count must be a non-negative integer"}), 400
+
+    rejected = _reject_nul_bytes(name=name, type=stop_type, device_id=device_id)
+    if rejected is not None:
+        return rejected
 
     stop = Stop(
         name=name,
@@ -1017,6 +1055,9 @@ def report_stop(stop_id):
         reason = ""
     if not isinstance(reason, str):
         return jsonify({"error": "reason must be a string"}), 400
+    rejected = _reject_nul_bytes(reason=reason)
+    if rejected is not None:
+        return rejected
 
     stop = db.session.get(Stop, stop_id)
     if stop is None:
@@ -1088,6 +1129,9 @@ def upload_greeting(stop_id):
     device_id = request.form.get("device_id")
     if not device_id:
         return jsonify({"error": "device_id is required"}), 400
+    rejected = _reject_nul_bytes(device_id=device_id)
+    if rejected is not None:
+        return rejected
 
     stop = db.session.get(Stop, stop_id)
     if stop is None:
@@ -1181,6 +1225,9 @@ def my_stops(device_id):
     """Kept exactly as it was for the installed dev build. The path form
     puts the device id into the gunicorn access line (see _search_args);
     new clients use POST /my-stops below."""
+    rejected = _reject_nul_bytes(device_id=device_id)
+    if rejected is not None:
+        return rejected
     return jsonify(_my_stops_payload(device_id))
 
 
@@ -1208,6 +1255,9 @@ def my_stops_lookup():
     device_id = data.get("device_id") if isinstance(data, dict) else None
     if not isinstance(device_id, str) or not device_id.strip():
         return jsonify({"error": "device_id is required"}), 400
+    rejected = _reject_nul_bytes(device_id=device_id)
+    if rejected is not None:
+        return rejected
     return jsonify(_my_stops_payload(device_id))
 
 
@@ -1218,6 +1268,9 @@ def update_stop(stop_id):
     device_id = data.get("device_id")
     if not device_id:
         return jsonify({"error": "device_id is required"}), 400
+    rejected = _reject_nul_bytes(device_id=device_id)
+    if rejected is not None:
+        return rejected
 
     stop = db.session.get(Stop, stop_id)
     if stop is None:
@@ -1395,6 +1448,9 @@ def check_in():
 
     if not device_id or stop_id is None or latitude is None or longitude is None:
         return jsonify({"error": "device_id, stop_id, latitude, and longitude are required"}), 400
+    rejected = _reject_nul_bytes(device_id=device_id)
+    if rejected is not None:
+        return rejected
 
     outcome = _apply_check_in(device_id, stop_id, latitude, longitude, date.today())
 
@@ -1427,6 +1483,16 @@ class _BatchCheckInItem(PydanticBaseModel):
 class _CheckInBatchPayload(PydanticBaseModel):
     device_id: str = Field(min_length=1)
     checkins: List[_BatchCheckInItem] = Field(min_length=1, max_length=CHECKIN_BATCH_MAX_ITEMS)
+
+    @field_validator("device_id")
+    @classmethod
+    def _reject_nul_in_device_id(cls, value):
+        # Same rule as _reject_nul_bytes on every other route, surfaced
+        # through this route's own 400 shape ("invalid batch payload" +
+        # detail) rather than a second one.
+        if _contains_nul(value):
+            raise ValueError("device_id must not contain NUL characters")
+        return value
 
     @field_validator("checkins")
     @classmethod
@@ -1498,6 +1564,9 @@ def night_ledger(device_id):
     and how many of the greetings they encountered they actually got to
     hear. Deliberately scoped to today's CheckIn rows rather than tracking
     anything new -- no separate "nearby but not visited" data model yet."""
+    rejected = _reject_nul_bytes(device_id=device_id)
+    if rejected is not None:
+        return rejected
     today = date.today()
     checkins_today = CheckIn.query.filter_by(device_id=device_id, check_in_date=today).all()
     stop_ids = [checkin.stop_id for checkin in checkins_today]
@@ -1576,6 +1645,18 @@ def register_business():
         if isinstance(points_cost, bool) or not isinstance(points_cost, int) or points_cost < 0:
             return jsonify({"error": "points_cost must be a non-negative integer"}), 400
 
+    rejected = _reject_nul_bytes(
+        name=name,
+        address=address,
+        category=category,
+        description=description,
+        contact_email=contact_email,
+        reward_offer=reward_offer,
+        device_id=device_id,
+    )
+    if rejected is not None:
+        return rejected
+
     business = Business(
         name=name,
         address=address,
@@ -1647,6 +1728,9 @@ def trivia_today():
 
     device_id = request.args.get("device_id")
     if device_id:
+        rejected = _reject_nul_bytes(device_id=device_id)
+        if rejected is not None:
+            return rejected
         answered = TriviaAnswer.query.filter_by(device_id=device_id, answer_date=today).first()
         result["already_answered"] = answered is not None
         result["was_correct"] = answered.was_correct if answered is not None else None
@@ -1663,6 +1747,9 @@ def trivia_answer():
 
     if not device_id or answer is None:
         return jsonify({"error": "device_id and answer are required"}), 400
+    rejected = _reject_nul_bytes(device_id=device_id)
+    if rejected is not None:
+        return rejected
 
     today = date.today()
     if TriviaAnswer.query.filter_by(device_id=device_id, answer_date=today).first() is not None:
@@ -1724,6 +1811,9 @@ def redeem_reward(reward_id):
     device_id = data.get("device_id")
     if not device_id:
         return jsonify({"error": "device_id is required"}), 400
+    rejected = _reject_nul_bytes(device_id=device_id)
+    if rejected is not None:
+        return rejected
 
     reward = _find_reward(reward_id)
     if reward is None:
@@ -1770,6 +1860,9 @@ def get_redemptions(device_id):
     #
     # This surfaced as an intermittently failing test, but the test was right:
     # the API's ordering was genuinely unstable in production too.
+    rejected = _reject_nul_bytes(device_id=device_id)
+    if rejected is not None:
+        return rejected
     redemptions = (
         Redemption.query.filter_by(device_id=device_id)
         .order_by(Redemption.created_at.desc(), Redemption.id.desc())
@@ -1796,6 +1889,9 @@ def get_redemptions(device_id):
 
 @app.route("/points/<device_id>", methods=["GET"])
 def get_points(device_id):
+    rejected = _reject_nul_bytes(device_id=device_id)
+    if rejected is not None:
+        return rejected
     household = Household.query.filter_by(device_id=device_id).first()
     points = household.points if household is not None else 0
     greetings_unlocked = household.greetings_unlocked if household is not None else False
@@ -1822,6 +1918,9 @@ def mint_legend_code():
         return jsonify({"error": "device_id is required"}), 400
     if not transaction_id:
         return jsonify({"error": "transaction_id is required"}), 400
+    rejected = _reject_nul_bytes(device_id=device_id, transaction_id=transaction_id)
+    if rejected is not None:
+        return rejected
 
     existing = LegendUnlock.query.filter_by(device_id=device_id).first()
     if existing is not None:

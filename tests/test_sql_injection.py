@@ -433,36 +433,196 @@ def test_trivia_today_query_string_device_id_is_a_bound_parameter(client, seeded
 # ---------------------------------------------------------------------------
 
 
+NUL = "\u0000"
+
+
+def _nul_message(field):
+    return f"{field} must not contain NUL characters"
+
+
 def test_nul_byte_in_string_fields(client, seeded):
-    """OBSERVED on SQLite: the sqlite3 driver stores and compares a str that
-    contains U+0000 like any other, so the registration lands and the
-    lookup finds it. REASONED for Postgres: psycopg2 refuses a str with a
-    NUL before the query is sent ("A string literal cannot contain NUL
-    (0x00) characters"), so /register-stop would 500 there and nothing
-    would be stored. Either way nothing is executed as SQL; the difference
-    is a 201 versus a 500. A one-line reject of '\\x00' in the string
-    validators would make both databases answer 400. Not changed here."""
+    """History: before 2026-10-28 this test accepted 201 or 400, because the
+    two databases disagreed. OBSERVED on SQLite: the sqlite3 driver stores
+    and compares a str that contains U+0000 like any other, so the
+    registration landed. REASONED for Postgres: psycopg2 refuses a str with
+    a NUL before the query is sent ("A string literal cannot contain NUL
+    (0x00) characters"), so /register-stop 500'd there (seen in production
+    2026-10-26). Nothing was ever executed as SQL either way. app.py now
+    rejects a NUL in every request string before the first query, so both
+    databases answer 400 and this test asserts exactly that."""
     before = _snapshot()
-    name = "Seed\u0000House"
-    device_id = "nul\u0000device"
+    name = f"Seed{NUL}House"
+    device_id = f"nul{NUL}device"
 
     created = client.post(
         "/register-stop",
         json={"name": name, "type": "house", "latitude": 11.0, "longitude": 11.0, "device_id": device_id},
     )
-    assert created.status_code in (201, 400), created.status_code
+    assert created.status_code == 400, created.status_code
+    assert created.get_json() == {"error": _nul_message("name")}
 
-    after = _snapshot()
-    if created.status_code == 201:
-        assert created.get_json()["name"] == name
-        mine = client.post("/my-stops", json={"device_id": device_id})
-        assert mine.status_code == 200
-        assert [s["name"] for s in mine.get_json()] == [name]
-        expected = dict(before)
-        expected["stop"] += 1
-        assert after == expected
-    else:
-        assert after == before
+    mine = client.post("/my-stops", json={"device_id": device_id})
+    assert mine.status_code == 400
+    assert mine.get_json() == {"error": _nul_message("device_id")}
+
+    assert _snapshot() == before
+
+
+def test_nul_in_each_register_stop_field_is_400_and_writes_nothing(client, seeded):
+    before = _snapshot()
+    clean = {"name": "Clean", "type": "house", "latitude": 12.0, "longitude": 12.0, "device_id": "clean-device"}
+
+    for field in ("name", "type", "device_id"):
+        response = client.post("/register-stop", json={**clean, field: f"a{NUL}b"})
+        assert response.status_code == 400, field
+        assert response.get_json() == {"error": _nul_message(field)}, field
+
+    assert _snapshot() == before
+
+
+def test_nul_in_each_register_business_field_is_400_and_writes_nothing(client, seeded):
+    before = _snapshot()
+    clean = {
+        "name": "Clean Shop",
+        "address": "1 Clean St",
+        "latitude": 12.0,
+        "longitude": 12.0,
+        "category": "shop",
+        "description": "A shop",
+        "contact_email": "owner@example.com",
+        "reward_offer": "Free thing",
+        "device_id": "clean-business",
+    }
+
+    for field in ("name", "address", "category", "description", "contact_email", "reward_offer", "device_id"):
+        response = client.post("/register-business", json={**clean, field: f"a{NUL}b"})
+        assert response.status_code == 400, field
+        assert response.get_json() == {"error": _nul_message(field)}, field
+
+    assert _snapshot() == before
+
+
+def test_nul_in_report_reason_is_400_and_counts_no_report(client, seeded):
+    stop_id = seeded["id"]
+    before = _snapshot()
+
+    response = client.post(f"/report-stop/{stop_id}", json={"reason": f"spam{NUL}"})
+
+    assert response.status_code == 400
+    assert response.get_json() == {"error": _nul_message("reason")}
+    assert _snapshot() == before
+    assert db.session.get(Stop, stop_id).report_count == 0
+
+
+def test_nul_in_a_body_device_id_is_400_on_every_route_that_takes_one(client, seeded):
+    """Every JSON-body route that reads device_id, including the two whose
+    lookups would otherwise write a row for a brand-new id (trivia and
+    check-in) and the one that compares in Python rather than SQL
+    (update-stop, kept consistent with its siblings on purpose)."""
+    stop_id = seeded["id"]
+    device_id = f"nul{NUL}device"
+    before = _snapshot()
+    expected = {"error": _nul_message("device_id")}
+
+    assert client.post("/my-stops", json={"device_id": device_id}).get_json() == expected
+    assert client.patch(f"/update-stop/{stop_id}", json={"device_id": device_id, "candy_count": 1}).get_json() == expected
+    assert (
+        client.post("/check-in", json={"device_id": device_id, "stop_id": stop_id, "latitude": 42.0, "longitude": -71.0}).get_json()
+        == expected
+    )
+    assert client.post("/trivia/answer", json={"device_id": device_id, "answer": 0}).get_json() == expected
+    assert client.post("/redeem-reward/founder-1", json={"device_id": device_id}).get_json() == expected
+
+    with patch("app.verify_transaction") as mocked:
+        mocked.return_value = None
+        mint = client.post("/legend-mode/mint", json={"device_id": device_id, "transaction_id": "clean-txn"})
+        assert mint.get_json() == expected
+        mint = client.post("/legend-mode/mint", json={"device_id": "clean-legend", "transaction_id": f"txn{NUL}"})
+        assert mint.get_json() == {"error": _nul_message("transaction_id")}
+        assert mocked.call_count == 0, "a NUL must be refused before Apple is asked anything"
+
+    for route, payload in (
+        ("/my-stops", {"device_id": device_id}),
+        ("/check-in", {"device_id": device_id, "stop_id": stop_id, "latitude": 42.0, "longitude": -71.0}),
+        ("/trivia/answer", {"device_id": device_id, "answer": 0}),
+        ("/redeem-reward/founder-1", {"device_id": device_id}),
+    ):
+        assert client.post(route, json=payload).status_code == 400, route
+    assert client.patch(f"/update-stop/{stop_id}", json={"device_id": device_id, "candy_count": 1}).status_code == 400
+
+    assert _snapshot() == before
+    assert db.session.get(Stop, stop_id).candy_count is None
+
+
+def test_nul_in_the_batch_device_id_is_rejected_by_validation(client, seeded):
+    before = _snapshot()
+
+    response = client.post(
+        "/check-in/batch",
+        json={
+            "device_id": f"nul{NUL}device",
+            "checkins": [
+                {"stop_id": seeded["id"], "latitude": 42.0, "longitude": -71.0, "checked_in_at": "2026-10-25T20:00:00Z"}
+            ],
+        },
+    )
+
+    assert response.status_code == 400
+    body = response.get_json()
+    assert body["error"] == "invalid batch payload"
+    assert any(_nul_message("device_id") in item["msg"] for item in body["detail"]), body["detail"]
+    assert _snapshot() == before
+
+
+def test_nul_in_the_form_device_id_is_400_before_the_file_is_read(client, seeded):
+    before = _snapshot()
+
+    response = client.post(f"/upload-greeting/{seeded['id']}", data={"device_id": f"nul{NUL}device"})
+
+    assert response.status_code == 400
+    assert response.get_json() == {"error": _nul_message("device_id")}
+    assert _snapshot() == before
+
+
+def test_nul_in_a_path_or_query_device_id_is_400(client, seeded):
+    """Werkzeug decodes %00 in a path segment to U+0000 and hands it to the
+    view, so these four GET routes (and trivia/today's query string) would
+    have sent the NUL to the database."""
+    encoded = _path(f"nul{NUL}device")
+    before = _snapshot()
+    expected = {"error": _nul_message("device_id")}
+
+    for route in (f"/my-stops/{encoded}", f"/night-ledger/{encoded}", f"/redemptions/{encoded}", f"/points/{encoded}"):
+        response = client.get(route)
+        assert response.status_code == 400, route
+        assert response.get_json() == expected, route
+
+    trivia = client.get(f"/trivia/today?device_id={encoded}")
+    assert trivia.status_code == 400
+    assert trivia.get_json() == expected
+
+    assert _snapshot() == before
+
+
+def test_nul_rejection_never_reaches_the_engine(client, seeded, executed_sql):
+    """The whole point: the 500 was the driver refusing the parameter, so the
+    fix has to stop the request BEFORE a statement is issued with it."""
+    device_id = f"nul{NUL}device"
+
+    # Positive control first: a clean id on the same route DOES show up as a
+    # bound parameter, so an empty list below means "refused before the
+    # query", not "the listener saw nothing".
+    client.post("/my-stops", json={"device_id": "seed-owner"})
+    assert any("seed-owner" in repr(p) for _, p in executed_sql)
+
+    client.post("/register-stop", json={"name": "x", "type": "house", "latitude": 1.0, "longitude": 1.0, "device_id": device_id})
+    client.post("/my-stops", json={"device_id": device_id})
+    client.get(f"/points/{_path(device_id)}")
+
+    # repr() of a str holding U+0000 spells it as the four characters \x00,
+    # so that is the needle; the raw character would never match.
+    bound = [p for _, p in executed_sql if "\\x00" in repr(p)]
+    assert bound == [], bound
 
 
 # ---------------------------------------------------------------------------
